@@ -63,6 +63,11 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.6.0</version>
         <configuration>
+          <!-- Unit tests and the *IT socket-level tests both run in mvn verify (they only use loopback fakes). -->
+          <includes>
+            <include>**/*Test.java</include>
+            <include>**/*IT.java</include>
+          </includes>
           <!-- Real Open-Meteo smoke tests run only on request: mvn test -Dgroups=live -->
           <excludedGroups>live</excludedGroups>
         </configuration>
