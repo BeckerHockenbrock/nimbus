@@ -1,6 +1,6 @@
 # Nimbus: A Caching, Rate-Limiting Reverse Proxy for the Open-Meteo Weather API
 
-> **Status:** Planning. No application code exists yet. **Do not start implementation until the owner explicitly says so.**
+> **Status:** Phase 0 (project skeleton) complete. Implement later phases only when the owner explicitly says so.
 > **Last updated:** 2026-10-22 (revision 2)
 > **Audience:** the project owner (a high school CS student building a portfolio project with AI assistance) and any coding agent that implements this plan phase by phase.
 
@@ -613,7 +613,7 @@ nimbus/
 
 **Runtime dependencies: Gson only. Test dependencies: JUnit only.**
 
-`pom.xml` skeleton (versions checked on Maven Central on 2026-10-22; re-check them in Phase 0):
+`pom.xml` skeleton (versions checked on Maven Central on 2026-10-22 and re-checked in Phase 0 the same day: all five are still the latest stable releases):
 
 ```xml
 <groupId>dev.nimbus</groupId><artifactId>nimbus</artifactId><version>0.1.0-SNAPSHOT</version>
@@ -668,7 +668,7 @@ nimbus/
 ### Phase 0: Project setup
 
 **Tasks**
-1. `git init` (the folder isn't a repository yet) and add `.gitignore`.
+1. `git init` and add `.gitignore`. (In practice the repository already existed, so only `.gitignore` was added.)
 2. Create `pom.xml` per Section 5.
 3. Create the package directories. Write `Main.run(args)`: each mode prints `"<mode>: not implemented yet"` and returns 0, an unknown mode prints usage and returns 2.
 4. Add `src/main/resources/nimbus.properties` with all keys from Appendix B.
