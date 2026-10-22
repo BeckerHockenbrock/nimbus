@@ -1,6 +1,7 @@
 package dev.nimbus.server;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import dev.nimbus.proxy.Outcome;
@@ -19,7 +20,7 @@ import java.util.Map;
  */
 final class HttpUtil {
 
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
 
     private HttpUtil() {
     }

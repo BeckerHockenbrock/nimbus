@@ -5,12 +5,7 @@ import dev.nimbus.upstream.UpstreamException;
 import dev.nimbus.upstream.UpstreamResponse;
 
 import java.net.URI;
-import java.net.http.HttpHeaders;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -28,7 +23,7 @@ public final class FakeUpstreamClient implements UpstreamClient {
     private final Queue<Function<URI, UpstreamResponse>> queued = new ConcurrentLinkedQueue<>();
     private final List<URI> calls = new CopyOnWriteArrayList<>();
     private volatile Function<URI, UpstreamResponse> defaultBehavior =
-            uri -> response(200, "{\"uri\":\"" + uri + "\"}", "Content-Type", "application/json");
+            uri -> TestEntries.response(200, "{\"uri\":\"" + uri + "\"}", "Content-Type", "application/json");
     private volatile CountDownLatch gate;
 
     /** Sets the behavior for every call that has no queued behavior. */
@@ -90,21 +85,5 @@ public final class FakeUpstreamClient implements UpstreamClient {
 
     public URI lastCall() {
         return calls.isEmpty() ? null : calls.get(calls.size() - 1);
-    }
-
-    /** Builds a response; {@code headerNameValues} alternates names and values, and names may repeat. */
-    public static UpstreamResponse response(int status, byte[] body, String... headerNameValues) {
-        if (headerNameValues.length % 2 != 0) {
-            throw new IllegalArgumentException("header names and values must come in pairs");
-        }
-        Map<String, List<String>> headers = new LinkedHashMap<>();
-        for (int i = 0; i < headerNameValues.length; i += 2) {
-            headers.computeIfAbsent(headerNameValues[i], k -> new ArrayList<>()).add(headerNameValues[i + 1]);
-        }
-        return new UpstreamResponse(status, body, HttpHeaders.of(headers, (name, value) -> true), 1_000_000L);
-    }
-
-    public static UpstreamResponse response(int status, String body, String... headerNameValues) {
-        return response(status, body.getBytes(StandardCharsets.UTF_8), headerNameValues);
     }
 }

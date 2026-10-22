@@ -1,10 +1,15 @@
 package dev.nimbus.proxy;
 
+import dev.nimbus.cache.Cache;
+import dev.nimbus.cache.CacheEntry;
+import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.upstream.UpstreamClient;
 import dev.nimbus.upstream.UpstreamException;
 import dev.nimbus.upstream.UpstreamResponse;
 
+import java.time.Instant;
+import java.time.InstantSource;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -21,13 +26,20 @@ public final class ProxyService {
     private static final System.Logger LOG = System.getLogger(ProxyService.class.getName());
 
     private final Map<String, Route> routes;
+    private final Cache<String, CacheEntry> cache;
     private final UpstreamClient upstream;
+    private final FreshnessPolicy freshness;
+    private final InstantSource clock;
     private final NimbusConfig config;
     private final QueryNormalizer normalizer;
 
-    public ProxyService(List<Route> routes, UpstreamClient upstream, NimbusConfig config) {
+    public ProxyService(List<Route> routes, Cache<String, CacheEntry> cache, UpstreamClient upstream,
+                        FreshnessPolicy freshness, InstantSource clock, NimbusConfig config) {
         this.routes = routes.stream().collect(Collectors.toUnmodifiableMap(Route::path, Function.identity()));
+        this.cache = cache;
         this.upstream = upstream;
+        this.freshness = freshness;
+        this.clock = clock;
         this.config = config;
         this.normalizer = new QueryNormalizer(config.maxQueryLength(), config.maxQueryParams());
     }
@@ -47,7 +59,31 @@ public final class ProxyService {
         } catch (BadRequestException e) {
             return ProxyResponse.error(e.status(), e.reason(), Outcome.INVALID);
         }
+
+        Instant now = clock.instant();
+        CacheEntry entry = cache.get(key);
+        if (entry != null && !now.isBefore(entry.staleUntil())) {
+            // Past any use. A concurrent request may have just stored a newer entry; removing it is still safe.
+            cache.remove(key);
+            entry = null;
+        }
+        if (entry != null && entry.isFresh(now)) {
+            return hit(entry, now);
+        }
+        // An expired entry still inside its stale window stays cached; stale-if-error uses it from Phase 5.
         return fetchFromUpstream(route, key);
+    }
+
+    /** A fresh cached 200. {@code Cache-Control} tells clients how long it stays fresh. */
+    private static ProxyResponse hit(CacheEntry entry, Instant now) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (entry.contentType() != null) {
+            headers.put("Content-Type", entry.contentType());
+        }
+        headers.put("X-Cache", Outcome.HIT.xCacheHeader());
+        headers.put("Age", Long.toString(entry.ageSeconds(now)));
+        headers.put("Cache-Control", "max-age=" + entry.freshSecondsRemaining(now));
+        return new ProxyResponse(200, headers, entry.body(), Outcome.HIT);
     }
 
     /** The single place where the upstream is called. */
@@ -68,7 +104,26 @@ public final class ProxyService {
         if (status >= 500) {
             return ProxyResponse.error(502, "Upstream returned HTTP " + status, Outcome.UPSTREAM_ERROR);
         }
+        if (status == 200) {
+            store(route, key, response);
+        }
+        // Other statuses below 500 are relayed and leave any existing entry alone.
         return relay(response);
+    }
+
+    /**
+     * Store-or-remove: after an upstream 200 the cache holds that response or nothing, so an older body is never
+     * served after a newer one was seen.
+     */
+    private void store(Route route, String key, UpstreamResponse response) {
+        FreshnessPolicy.Decision decision = freshness.decide(route, response, clock.instant());
+        switch (decision) {
+            case FreshnessPolicy.Store store -> cache.put(key, store.entry());
+            case FreshnessPolicy.DoNotStore doNotStore -> {
+                cache.remove(key);
+                LOG.log(System.Logger.Level.DEBUG, "Not caching " + key + ": " + doNotStore.reason());
+            }
+        }
     }
 
     /** A response received from the upstream, relayed as-is (PLAN.md, E4). */

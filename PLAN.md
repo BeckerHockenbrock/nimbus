@@ -1,6 +1,6 @@
 # Nimbus: A Caching, Rate-Limiting Reverse Proxy for the Open-Meteo Weather API
 
-> **Status:** Phases 0–1 implemented. Phase 1's manual real-API check is still pending: the cloud session that built it couldn't reach Open-Meteo (egress policy). Implement later phases only when the owner explicitly says so.
+> **Status:** Phases 0–2 implemented. Phase 1's manual real-API check is still pending: the cloud session that built it couldn't reach Open-Meteo (egress policy). Implement later phases only when the owner explicitly says so.
 > **Last updated:** 2026-10-22 (revision 2)
 > **Audience:** the project owner (a high school CS student building a portfolio project with AI assistance) and any coding agent that implements this plan phase by phase.
 
@@ -121,7 +121,7 @@
   - `no-store`, `private`, or `no-cache` means don't store.
   - `s-maxage`/`max-age` (or `Expires`) can only *shorten* the configured TTL.
   - The upstream `Age` header is subtracted from the freshness lifetime.
-  - `must-revalidate` or `proxy-revalidate` disables stale serving for that entry.
+  - `must-revalidate`, `proxy-revalidate`, or `s-maxage` (which carries `proxy-revalidate`'s semantics for shared caches, §5.2.2.10) disables stale serving for that entry.
   - `Vary: *` means don't store.
 - E10. Only `200` responses no larger than `maxEntryBytes` are stored.
 - E11. **Stale-if-error.** An expired entry stays usable for a stale window (forecast 1 h, geocoding 7 days). It is served, labeled `STALE`, when the upstream fails, times out, or is unavailable because of budget, cooldown, or concurrency limits.
@@ -353,7 +353,7 @@ Parsing rules:
 - Directive names are case-insensitive. Multiple header lines and comma-separated lists are merged.
 - Quoted values are unquoted.
 - Qualified forms (`no-cache="Set-Cookie"`, `private="x"`) are treated **as if unqualified**. That is stricter, and still correct.
-- A malformed or negative `max-age`/`s-maxage` is treated as `0`.
+- A malformed or negative `max-age`/`s-maxage` is treated as `0`. A value too large to represent is `2^31` (§1.2.2). For a repeated directive, the first occurrence wins (§4.2.1).
 
 **`FreshnessPolicy.decide(route, upstreamResponse, now)`** returns either `DoNotStore(reason)` or `Store(CacheEntry)`:
 
@@ -368,7 +368,8 @@ Parsing rules:
 6. `age` = the upstream `Age` header in seconds (0 if absent or invalid). `remaining = lifetime − age`. If `remaining ≤ 0`, don't store. This is the simplified §4.2.3 current-age calculation, ignoring network delay.
 7. Set the timestamps:
    - `freshUntil = receivedAt + remaining`.
-   - `staleAllowed = !(mustRevalidate || proxyRevalidate) && route.staleWindow > 0` (§5.2.2.2 and §5.2.2.8 forbid serving stale).
+   - `staleAllowed = !(mustRevalidate || proxyRevalidate || sMaxAge present) && route.staleWindow > 0` (§5.2.2.2 and §5.2.2.8 forbid serving stale; §5.2.2.10 says `s-maxage` incorporates `proxy-revalidate` for a shared cache).
+   - *Correction (Phase 2):* the `s-maxage` term was missing from the original plan. Open-Meteo doesn't send `s-maxage` today, so this changes nothing in practice.
    - `staleUntil = staleAllowed ? freshUntil + route.staleWindow : freshUntil`.
 
 **Store-or-remove rule:** after any upstream `200` for a key, the cache holds either that new response or *nothing*. A non-storable 200 (`no-store`, too big, and so on) removes any older entry for the key, so an older body is never served after a newer one was observed. Non-200 upstream responses leave existing entries alone, so they remain available for stale-if-error.
@@ -560,7 +561,7 @@ nimbus/
 | `Outcome` | Enum (Section 3.6) with `xCacheHeader()`, which returns `"HIT"`, `"MISS"`, `"STALE"`, `"COALESCED"`, or `null`. |
 | `Route` | `record Route(String path, URI upstreamUrl, Set<String> requiredParams, Duration ttl, Duration staleWindow)`. |
 | `QueryNormalizer` | Section 3.4. `String canonicalize(String rawQuery, Route route) throws BadRequestException`. `BadRequestException` carries the status (400 or 414) and reason. Nested `record QueryParam(String name, String value)`. |
-| `Cache<K,V>` | Interface: `V get(K)`, `boolean put(K,V)`, `V remove(K)`, `void clear()`, `int size()`, `long weightedSize()`, `long evictionCount()`. Implementations take `(int maxEntries, long maxBytes, ToLongBiFunction<K,V> weigher)` in their constructor. |
+| `Cache<K,V>` | Interface: `V get(K)`, `boolean put(K,V)`, `V remove(K)`, `void clear()`, `int size()`, `long weightedSize()`, `long evictionCount()`, and `List<K> keysInLruOrder()` (a snapshot from least to most recently used that doesn't change recency; O(n), for the model test and C1's key iteration — added in Phase 2). Implementations take `(int maxEntries, long maxBytes, ToLongBiFunction<K,V> weigher)` in their constructor. |
 | `LinkedHashMapCache<K,V>` | **Baseline.** `new LinkedHashMap<>(16, 0.75f, true)` (access order) guarded by one `ReentrantLock`. Eviction loops over `map.entrySet().iterator()` from the eldest entry while over a bound. It doesn't use `removeEldestEntry`, which removes at most one entry per `put` and can't enforce a byte bound. |
 | `LinkedListLruCache<K,V>` | **Track 2 stub only:** a constructor and methods that throw `UnsupportedOperationException("Track 2: owner implements")`, plus Javadoc listing the invariants to maintain. |
 | `CacheEntry` | Section 3.5. |

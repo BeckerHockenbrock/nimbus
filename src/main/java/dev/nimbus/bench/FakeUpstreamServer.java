@@ -1,6 +1,7 @@
 package dev.nimbus.bench;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -135,7 +136,7 @@ public final class FakeUpstreamServer implements AutoCloseable {
         }
     }
 
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
 
     private final HttpServer server;
     private final ExecutorService executor;

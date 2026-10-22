@@ -1,20 +1,28 @@
 package dev.nimbus.proxy;
 
-import static dev.nimbus.testutil.FakeUpstreamClient.response;
+import static dev.nimbus.testutil.TestEntries.response;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.nimbus.cache.Cache;
+import dev.nimbus.cache.CacheEntry;
+import dev.nimbus.cache.FreshnessPolicy;
+import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.testutil.FakeUpstreamClient;
+import dev.nimbus.testutil.MutableClock;
 import dev.nimbus.upstream.UpstreamException;
+import dev.nimbus.upstream.UpstreamResponse;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -29,7 +37,11 @@ class ProxyServiceTest {
             "nimbus.forecast.upstream", "http://upstream.test/v1/forecast",
             "nimbus.geocoding.upstream", "http://geo.test/v1/search"));
     private final FakeUpstreamClient upstream = new FakeUpstreamClient();
-    private final ProxyService service = new ProxyService(config.routes(), upstream, config);
+    private final MutableClock clock = new MutableClock();
+    private final Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(),
+            config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
+    private final ProxyService service = new ProxyService(config.routes(), cache, upstream,
+            FreshnessPolicy.from(config), clock, config);
 
     private ProxyResponse get(String path, String rawQuery) {
         return service.handle(new ProxyRequest("GET", path, rawQuery, CLIENT));
@@ -173,5 +185,192 @@ class ProxyServiceTest {
         upstream.respond(response(429, "{}", "Retry-After", "120"));
 
         assertEquals("120", get("/v1/forecast", "latitude=1&longitude=2").headers().get("Retry-After"));
+    }
+
+    // --- Phase 2: caching ---
+
+    private static final String BERLIN = "latitude=52.52437&longitude=13.41053&current=temperature_2m";
+    private static final String BERLIN_KEY = "/v1/forecast?current=temperature_2m&latitude=52.52437&longitude=13.41053";
+
+    private static UpstreamResponse forecastBody(String body, String... headers) {
+        String[] all = new String[headers.length + 2];
+        all[0] = "Content-Type";
+        all[1] = "application/json; charset=utf-8";
+        System.arraycopy(headers, 0, all, 2, headers.length);
+        return response(200, body, all);
+    }
+
+    @Test
+    void missThenHitWithOneUpstreamCall() {
+        upstream.respond(forecastBody("{\"t\":1}"));
+
+        ProxyResponse first = get("/v1/forecast", BERLIN);
+        ProxyResponse second = get("/v1/forecast", BERLIN);
+
+        assertEquals(Outcome.MISS, first.outcome());
+        assertEquals("MISS", first.headers().get("X-Cache"));
+        assertEquals(Outcome.HIT, second.outcome());
+        assertEquals(200, second.status());
+        assertEquals("HIT", second.headers().get("X-Cache"));
+        assertEquals("application/json; charset=utf-8", second.headers().get("Content-Type"));
+        assertNull(second.headers().get("X-Upstream-Latency-Ms"));
+        assertEquals(1, upstream.callCount());
+        assertEquals(1, cache.size());
+        assertTrue(cache.keysInLruOrder().contains(BERLIN_KEY));
+    }
+
+    @Test
+    void differentlyOrderedNamesShareAnEntry() {
+        get("/v1/forecast", "latitude=52.52437&longitude=13.41053&current=temperature_2m");
+
+        ProxyResponse reordered = get("/v1/forecast", "current=temperature_2m&longitude=13.41053&latitude=52.52437");
+
+        assertEquals(Outcome.HIT, reordered.outcome());
+        assertEquals(1, upstream.callCount());
+    }
+
+    @Test
+    void swappedValueOrderIsASeparateEntry() {
+        get("/v1/forecast", "latitude=1&longitude=2&current=temperature_2m,wind_speed_10m");
+
+        ProxyResponse swapped = get("/v1/forecast", "latitude=1&longitude=2&current=wind_speed_10m,temperature_2m");
+
+        assertEquals(Outcome.MISS, swapped.outcome());
+        assertEquals(2, upstream.callCount());
+        assertEquals(2, cache.size());
+    }
+
+    @Test
+    void expiresAfterTheConfiguredTtl() {
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(299));
+        assertEquals(Outcome.HIT, get("/v1/forecast", BERLIN).outcome());
+
+        clock.advance(Duration.ofSeconds(1)); // Exactly freshUntil: never a HIT.
+        assertEquals(Outcome.MISS, get("/v1/forecast", BERLIN).outcome());
+        assertEquals(2, upstream.callCount());
+
+        clock.advance(Duration.ofSeconds(301));
+        assertEquals(Outcome.MISS, get("/v1/forecast", BERLIN).outcome());
+        assertEquals(3, upstream.callCount());
+    }
+
+    @Test
+    void noStoreIsNeverHitAndRemovesTheExistingEntry() {
+        upstream.enqueue(forecastBody("{\"v\":\"old\"}"));
+        upstream.respond(forecastBody("{\"v\":\"new\"}", "Cache-Control", "no-store"));
+        get("/v1/forecast", BERLIN);
+        assertEquals(1, cache.size());
+        clock.advance(Duration.ofSeconds(301)); // Expired but inside the stale window, so still cached.
+        assertEquals(1, cache.size());
+
+        ProxyResponse refreshed = get("/v1/forecast", BERLIN);
+        ProxyResponse again = get("/v1/forecast", BERLIN);
+
+        assertEquals("{\"v\":\"new\"}", new String(refreshed.body(), StandardCharsets.UTF_8));
+        assertEquals("no-store", refreshed.headers().get("Cache-Control"));
+        assertEquals(Outcome.MISS, again.outcome());
+        assertNull(cache.get(BERLIN_KEY), "store-or-remove: the old body is gone");
+        assertEquals(3, upstream.callCount());
+    }
+
+    @Test
+    void tooBigForAnEntryIsRelayedButNotCached() {
+        int max = (int) config.cacheMaxEntryBytes();
+        upstream.respond(response(200, new byte[max + 1]));
+
+        assertEquals(max + 1, get("/v1/forecast", BERLIN).body().length);
+        assertEquals(Outcome.MISS, get("/v1/forecast", BERLIN).outcome());
+        assertEquals(0, cache.size());
+    }
+
+    @Test
+    void upstream400IsNeverCached() {
+        upstream.respond(response(400, "{\"reason\":\"bad\",\"error\":true}"));
+
+        get("/v1/forecast", BERLIN);
+        ProxyResponse second = get("/v1/forecast", BERLIN);
+
+        assertEquals(400, second.status());
+        assertEquals(Outcome.MISS, second.outcome());
+        assertEquals(2, upstream.callCount());
+        assertEquals(0, cache.size());
+    }
+
+    @Test
+    void nonOkResponsesLeaveTheExistingEntryAlone() {
+        upstream.enqueue(forecastBody("{\"v\":1}"));
+        upstream.enqueue(response(404, "{}"));
+        upstream.respond(response(503, "{}"));
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        assertEquals(404, get("/v1/forecast", BERLIN).status());
+        assertEquals(502, get("/v1/forecast", BERLIN).status(), "stale-if-error arrives in Phase 5");
+
+        assertEquals(1, cache.size(), "kept for stale-if-error");
+    }
+
+    @Test
+    void entryPastItsStaleWindowIsRemovedAtLookup() {
+        get("/v1/forecast", BERLIN);
+        upstream.respond(response(500, "{}"));
+        clock.advance(config.forecastTtl().plus(config.forecastStale()));
+
+        assertEquals(502, get("/v1/forecast", BERLIN).status());
+
+        assertEquals(0, cache.size());
+    }
+
+    @Test
+    void servedBytesAreTheUpstreamBytes() {
+        byte[] body = "{\"temperature_2m\":12.3,\"unit\":\"°C\"}".getBytes(StandardCharsets.UTF_8);
+        upstream.respond(response(200, body, "Content-Type", "application/json"));
+
+        ProxyResponse miss = get("/v1/forecast", BERLIN);
+        ProxyResponse hit = get("/v1/forecast", BERLIN);
+
+        assertArrayEquals(body, miss.body());
+        assertArrayEquals(body, hit.body());
+        assertSame(body, hit.body(), "not copied");
+    }
+
+    @Test
+    void ageAndMaxAgeAtSeveralOffsets() {
+        get("/v1/forecast", BERLIN);
+        assertAgeAndMaxAge(0, 300);
+        clock.advance(Duration.ofMillis(100_500));
+        assertAgeAndMaxAge(100, 199);
+        clock.advance(Duration.ofMillis(199_400)); // 299.9 s
+        assertAgeAndMaxAge(299, 0);
+    }
+
+    @Test
+    void upstreamAgeIsAddedToAge() {
+        upstream.respond(forecastBody("{}", "Age", "20"));
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(10));
+
+        assertAgeAndMaxAge(30, 270);
+    }
+
+    @Test
+    void geocodingUsesItsOwnLifetime() {
+        upstream.respond(response(200, "{\"results\":[]}", "Cache-Control", "public, max-age=86400"));
+        get("/v1/search", "name=Berlin");
+        clock.advance(Duration.ofHours(23));
+
+        ProxyResponse hit = get("/v1/search", "name=Berlin");
+
+        assertEquals(Outcome.HIT, hit.outcome());
+        assertEquals("max-age=3600", hit.headers().get("Cache-Control"));
+        assertEquals(String.valueOf(Duration.ofHours(23).toSeconds()), hit.headers().get("Age"));
+    }
+
+    private void assertAgeAndMaxAge(long age, long maxAge) {
+        ProxyResponse hit = get("/v1/forecast", BERLIN);
+        assertEquals(Outcome.HIT, hit.outcome());
+        assertEquals(String.valueOf(age), hit.headers().get("Age"));
+        assertEquals("max-age=" + maxAge, hit.headers().get("Cache-Control"));
     }
 }

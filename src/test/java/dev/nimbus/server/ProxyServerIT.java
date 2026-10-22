@@ -6,6 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.nimbus.bench.FakeUpstreamServer;
+import dev.nimbus.cache.CacheEntry;
+import dev.nimbus.cache.FreshnessPolicy;
+import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.testutil.FakeUpstreamClient;
@@ -17,6 +20,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.InstantSource;
 import java.util.Map;
 
 import org.junit.jupiter.api.AfterEach;
@@ -55,7 +59,10 @@ class ProxyServerIT {
     }
 
     private void startProxy(NimbusConfig config, UpstreamClient upstream) throws IOException {
-        server = new ProxyServer(config, new ProxyService(config.routes(), upstream, config));
+        LinkedHashMapCache<String, CacheEntry> cache = new LinkedHashMapCache<>(
+                config.cacheMaxEntries(), config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
+        server = new ProxyServer(config, new ProxyService(config.routes(), cache, upstream,
+                FreshnessPolicy.from(config), InstantSource.system(), config));
         server.start();
     }
 
@@ -86,6 +93,13 @@ class ProxyServerIT {
         assertEquals(52.52437, body.get("latitude").getAsDouble());
         assertEquals("latitude=52.52437&longitude=13.41053",
                 body.getAsJsonObject("fake").get("query").getAsString(), "upstream got the canonical query");
+        assertEquals(1, fake.requestsFor("/v1/forecast?latitude=52.52437&longitude=13.41053"));
+
+        HttpResponse<String> hit = send("GET", "/v1/forecast?latitude=52.52437&longitude=13.41053");
+        assertEquals(200, hit.statusCode());
+        assertEquals("HIT", hit.headers().firstValue("X-Cache").orElseThrow());
+        assertEquals("0", hit.headers().firstValue("Age").orElseThrow());
+        assertEquals(forecast.body(), hit.body(), "byte-identical over HTTP");
         assertEquals(1, fake.requestsFor("/v1/forecast?latitude=52.52437&longitude=13.41053"));
 
         HttpResponse<String> search = send("GET", "/v1/search?name=Berlin&count=1");

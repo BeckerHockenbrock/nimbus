@@ -1,6 +1,10 @@
 package dev.nimbus;
 
 import dev.nimbus.bench.FakeUpstreamServer;
+import dev.nimbus.cache.Cache;
+import dev.nimbus.cache.CacheEntry;
+import dev.nimbus.cache.FreshnessPolicy;
+import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.server.ProxyServer;
@@ -8,6 +12,7 @@ import dev.nimbus.upstream.HttpUpstreamClient;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -107,7 +112,10 @@ public final class Main {
         NimbusConfig config = NimbusConfig.load(flags, System.getenv(), System.getProperties());
         HttpUpstreamClient upstream = new HttpUpstreamClient(config.upstreamConnectTimeout(),
                 config.upstreamDeadline(), config.upstreamMaxResponseBytes());
-        ProxyService service = new ProxyService(config.routes(), upstream, config);
+        Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
+                (key, entry) -> entry.weightBytes(key));
+        ProxyService service = new ProxyService(config.routes(), cache, upstream, FreshnessPolicy.from(config),
+                InstantSource.system(), config);
         ProxyServer server = new ProxyServer(config, service);
         try {
             server.start();

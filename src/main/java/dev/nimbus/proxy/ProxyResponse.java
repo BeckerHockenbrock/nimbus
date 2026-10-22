@@ -1,6 +1,7 @@
 package dev.nimbus.proxy;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
@@ -15,7 +16,7 @@ public record ProxyResponse(int status, Map<String, String> headers, byte[] body
 
     public static final String JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 
-    private static final Gson GSON = new Gson();
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
 
     /** Proxy-generated error body: Open-Meteo's error shape plus a source field (PLAN.md, E6). */
     private record ErrorBody(boolean error, String reason, String source) {
