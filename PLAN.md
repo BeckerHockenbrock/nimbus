@@ -1,6 +1,6 @@
 # Nimbus: A Caching, Rate-Limiting Reverse Proxy for the Open-Meteo Weather API
 
-> **Status:** Phases 0–2 implemented. Phase 1's manual real-API check is still pending: the cloud session that built it couldn't reach Open-Meteo (egress policy). Implement later phases only when the owner explicitly says so.
+> **Status:** Phases 0–3 implemented. Phase 1's manual real-API check is still pending: the cloud session that built it couldn't reach Open-Meteo (egress policy). Implement later phases only when the owner explicitly says so.
 > **Last updated:** 2026-10-22 (revision 2)
 > **Audience:** the project owner (a high school CS student building a portfolio project with AI assistance) and any coding agent that implements this plan phase by phase.
 
@@ -398,7 +398,7 @@ Parsing rules:
 **Upstream counters** are incremented at the single place where `UpstreamClient.fetch` is called:
 - `upstream.calls`: HTTP requests actually sent. No retries exist, so there is at most one per proxied request.
 - `upstream.responses`: a complete response was received within limits, with any status. `upstream.status429` and `upstream.status5xx` break it down.
-- `upstream.failures.timeout`, `.connection`, and `.tooLarge`.
+- `upstream.failures.timeout`, `.connection`, and `.tooLarge`. An `INTERRUPTED` call (shutdown) counts as `.connection`, so I3 still holds.
 - `upstream.skipped.budget`, `.cooldown`, and `.noPermit`: requests that needed the upstream but didn't call it.
 
 **Derived values:**
@@ -425,7 +425,7 @@ Parsing rules:
 - **Client latency** (GUI and `LoadGenerator`) runs from just before `HttpClient.send` until the body has been fully read.
 - **Percentiles** use the nearest-rank method over a sliding window of the most recent `nimbus.metrics.latencyWindow` samples (default 4,096) per recorder. To compute one, sort the window and take `index = ceil(p/100 × n) − 1`. Each recorder reports `count` (samples in the window), `totalRecorded` (all time), `p50`, `p95`, `p99`, and `max` (the window's max). With an empty window, the values are `null`.
 
-**Ordering:** `ProxyService` increments the outcome counter *before* returning, and `ProxyHandler` records latency *after* writing. A client that has just received a response therefore always sees that request's outcome counted, but its latency sample may arrive a moment later. Tests that check latency counts must poll with a timeout.
+**Ordering:** `ProxyService` increments the outcome counter *before* returning (it also catches its own unexpected exceptions and counts them as `INTERNAL_ERROR`; `ProxyHandler`'s catch-all counts one only if the service itself throws), and `ProxyHandler` records latency *after* writing. A client that has just received a response therefore always sees that request's outcome counted, but its latency sample may arrive a moment later. Tests that check latency counts must poll with a timeout.
 
 **Snapshot consistency:** `LongAdder.sum()` reads aren't atomic across counters. While requests are still in flight, a snapshot may be off by those requests. The invariants hold exactly once traffic stops, which is when tests check them.
 
@@ -820,7 +820,7 @@ nimbus/
   1. MISS
   2. HIT
   3. HIT
-  4. Rate-limited (configure a capacity that forces it)
+  4. Rate-limited (configure a capacity that forces it). *Deferred to Phase 4 (Phase 3 note):* the rate limiter doesn't exist until Phase 4, and a phase must not depend on a later one, so Phase 3 runs the other seven steps (`requests.total == 7`) and Phase 4 adds this step back.
   5. INVALID (missing `latitude`)
   6. 404 path
   7. Clock past fresh → MISS

@@ -15,6 +15,7 @@ import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
+import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.testutil.FakeUpstreamClient;
 import dev.nimbus.testutil.MutableClock;
 import dev.nimbus.upstream.UpstreamException;
@@ -40,8 +41,9 @@ class ProxyServiceTest {
     private final MutableClock clock = new MutableClock();
     private final Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(),
             config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
+    private final ProxyMetrics metrics = new ProxyMetrics(config, cache, clock);
     private final ProxyService service = new ProxyService(config.routes(), cache, upstream,
-            FreshnessPolicy.from(config), clock, config);
+            FreshnessPolicy.from(config), metrics, clock, config);
 
     private ProxyResponse get(String path, String rawQuery) {
         return service.handle(new ProxyRequest("GET", path, rawQuery, CLIENT));
