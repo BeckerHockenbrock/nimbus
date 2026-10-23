@@ -20,7 +20,8 @@ import java.util.Map;
  */
 final class HttpUtil {
 
-    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+    /** {@code null}s are written out: {@code /metrics} reports empty percentiles and ratios as {@code null}. */
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
 
     private HttpUtil() {
     }

@@ -4,6 +4,7 @@ import dev.nimbus.cache.Cache;
 import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.config.NimbusConfig;
+import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.upstream.UpstreamClient;
 import dev.nimbus.upstream.UpstreamException;
 import dev.nimbus.upstream.UpstreamResponse;
@@ -29,22 +30,37 @@ public final class ProxyService {
     private final Cache<String, CacheEntry> cache;
     private final UpstreamClient upstream;
     private final FreshnessPolicy freshness;
+    private final ProxyMetrics metrics;
     private final InstantSource clock;
     private final NimbusConfig config;
     private final QueryNormalizer normalizer;
 
     public ProxyService(List<Route> routes, Cache<String, CacheEntry> cache, UpstreamClient upstream,
-                        FreshnessPolicy freshness, InstantSource clock, NimbusConfig config) {
+                        FreshnessPolicy freshness, ProxyMetrics metrics, InstantSource clock, NimbusConfig config) {
         this.routes = routes.stream().collect(Collectors.toUnmodifiableMap(Route::path, Function.identity()));
         this.cache = cache;
         this.upstream = upstream;
         this.freshness = freshness;
+        this.metrics = metrics;
         this.clock = clock;
         this.config = config;
         this.normalizer = new QueryNormalizer(config.maxQueryLength(), config.maxQueryParams());
     }
 
+    /** Handles one proxied request and counts its {@link Outcome} exactly once, before returning. */
     public ProxyResponse handle(ProxyRequest request) {
+        ProxyResponse response;
+        try {
+            response = decide(request);
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.ERROR, "Internal error handling " + request.path(), e);
+            response = ProxyResponse.error(500, "Internal proxy error", Outcome.INTERNAL_ERROR);
+        }
+        metrics.recordOutcome(response.outcome());
+        return response;
+    }
+
+    private ProxyResponse decide(ProxyRequest request) {
         if (!"GET".equals(request.method())) {
             return ProxyResponse.error(405, "Method " + request.method() + " is not allowed; use GET",
                     Outcome.INVALID, Map.of("Allow", "GET"));
@@ -89,12 +105,18 @@ public final class ProxyService {
     /** The single place where the upstream is called. */
     private ProxyResponse fetchFromUpstream(Route route, String key) {
         UpstreamResponse response;
+        long start = System.nanoTime();
+        metrics.upstreamStarted();
         try {
             response = upstream.fetch(route.upstreamUri(key));
         } catch (UpstreamException e) {
+            metrics.upstreamFailure(e.kind());
             LOG.log(System.Logger.Level.WARNING, "Upstream " + e.kind() + " for " + key + ": " + e.getMessage());
             return upstreamFailure(e);
+        } finally {
+            metrics.upstreamFinished(System.nanoTime() - start);
         }
+        metrics.upstreamResponse(response.status());
         int status = response.status();
         if (status == 429) {
             long retryAfter = Math.max(config.upstreamCooldown().toSeconds(), retryAfterSeconds(response));

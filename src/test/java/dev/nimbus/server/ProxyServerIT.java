@@ -10,6 +10,7 @@ import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
+import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.testutil.FakeUpstreamClient;
 import dev.nimbus.upstream.HttpUpstreamClient;
@@ -61,8 +62,9 @@ class ProxyServerIT {
     private void startProxy(NimbusConfig config, UpstreamClient upstream) throws IOException {
         LinkedHashMapCache<String, CacheEntry> cache = new LinkedHashMapCache<>(
                 config.cacheMaxEntries(), config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
+        ProxyMetrics metrics = new ProxyMetrics(config, cache, InstantSource.system());
         server = new ProxyServer(config, new ProxyService(config.routes(), cache, upstream,
-                FreshnessPolicy.from(config), InstantSource.system(), config));
+                FreshnessPolicy.from(config), metrics, InstantSource.system(), config), metrics);
         server.start();
     }
 
