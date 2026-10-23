@@ -1,6 +1,6 @@
 # Nimbus: A Caching, Rate-Limiting Reverse Proxy for the Open-Meteo Weather API
 
-> **Status:** Phase 0 (project skeleton) complete. Implement later phases only when the owner explicitly says so.
+> **Status:** Phases 0–2 implemented. Phase 1's manual real-API check is still pending: the cloud session that built it couldn't reach Open-Meteo (egress policy). Implement later phases only when the owner explicitly says so.
 > **Last updated:** 2026-10-22 (revision 2)
 > **Audience:** the project owner (a high school CS student building a portfolio project with AI assistance) and any coding agent that implements this plan phase by phase.
 
@@ -121,7 +121,7 @@
   - `no-store`, `private`, or `no-cache` means don't store.
   - `s-maxage`/`max-age` (or `Expires`) can only *shorten* the configured TTL.
   - The upstream `Age` header is subtracted from the freshness lifetime.
-  - `must-revalidate` or `proxy-revalidate` disables stale serving for that entry.
+  - `must-revalidate`, `proxy-revalidate`, or `s-maxage` (which carries `proxy-revalidate`'s semantics for shared caches, §5.2.2.10) disables stale serving for that entry.
   - `Vary: *` means don't store.
 - E10. Only `200` responses no larger than `maxEntryBytes` are stored.
 - E11. **Stale-if-error.** An expired entry stays usable for a stale window (forecast 1 h, geocoding 7 days). It is served, labeled `STALE`, when the upstream fails, times out, or is unavailable because of budget, cooldown, or concurrency limits.
@@ -301,7 +301,8 @@ flowchart TD
 4. Split each segment at the **first** `=`.
    - The name is the part before it, and the value is everything after, which may be empty.
    - A segment with no `=` has a *null* value (the `flag` form), kept distinct from `flag=` (an empty value).
-   - Decode both parts with `URLDecoder.decode(s, UTF_8)`. Malformed escapes like `%zz` raise `IllegalArgumentException`, which becomes **400**.
+   - Form-decode both parts (`+` is a space, `%XX` is a byte) **strictly**: malformed escapes like `%zz` and escaped bytes that aren't valid UTF-8 (like `%FF`) become **400**.
+   - *Correction (Phase 1):* the plan originally said `URLDecoder.decode(s, UTF_8)`. On JDK 21 that silently replaces invalid UTF-8 with U+FFFD, so `%FF` and `%FE` would share one cache key and the upstream would receive a different query than the client sent. Its Javadoc leaves error handling to the implementation. `QueryNormalizer.decode` decodes with a reporting `CharsetDecoder` instead.
 5. More than `maxQueryParams` parameters (default 100) → **400**.
 6. **Stable-sort** the `(name, value)` pairs by name with `List.sort(Comparator.comparing(QueryParam::name))`. `List.sort` is guaranteed stable, so repeated parameters keep their original relative order.
 7. Every required parameter of the route must appear at least once with a non-null value; otherwise **400**. Values themselves are **not** validated, and the upstream's own `400` is relayed (not cached).
@@ -352,7 +353,7 @@ Parsing rules:
 - Directive names are case-insensitive. Multiple header lines and comma-separated lists are merged.
 - Quoted values are unquoted.
 - Qualified forms (`no-cache="Set-Cookie"`, `private="x"`) are treated **as if unqualified**. That is stricter, and still correct.
-- A malformed or negative `max-age`/`s-maxage` is treated as `0`.
+- A malformed or negative `max-age`/`s-maxage` is treated as `0`. A value too large to represent is `2^31` (§1.2.2). For a repeated directive, the first occurrence wins (§4.2.1).
 
 **`FreshnessPolicy.decide(route, upstreamResponse, now)`** returns either `DoNotStore(reason)` or `Store(CacheEntry)`:
 
@@ -367,7 +368,8 @@ Parsing rules:
 6. `age` = the upstream `Age` header in seconds (0 if absent or invalid). `remaining = lifetime − age`. If `remaining ≤ 0`, don't store. This is the simplified §4.2.3 current-age calculation, ignoring network delay.
 7. Set the timestamps:
    - `freshUntil = receivedAt + remaining`.
-   - `staleAllowed = !(mustRevalidate || proxyRevalidate) && route.staleWindow > 0` (§5.2.2.2 and §5.2.2.8 forbid serving stale).
+   - `staleAllowed = !(mustRevalidate || proxyRevalidate || sMaxAge present) && route.staleWindow > 0` (§5.2.2.2 and §5.2.2.8 forbid serving stale; §5.2.2.10 says `s-maxage` incorporates `proxy-revalidate` for a shared cache).
+   - *Correction (Phase 2):* the `s-maxage` term was missing from the original plan. Open-Meteo doesn't send `s-maxage` today, so this changes nothing in practice.
    - `staleUntil = staleAllowed ? freshUntil + route.staleWindow : freshUntil`.
 
 **Store-or-remove rule:** after any upstream `200` for a key, the cache holds either that new response or *nothing*. A non-storable 200 (`no-store`, too big, and so on) removes any older entry for the key, so an older body is never served after a newer one was observed. Non-200 upstream responses leave existing entries alone, so they remain available for stale-if-error.
@@ -549,7 +551,7 @@ nimbus/
 |---|---|
 | `Main` | `static int run(String[] args)` returns an exit code, and `main` calls `System.exit(run(args))`. Parses the mode (`server`, `gui`, `all` (default), `bench`, or `fake-upstream`) and the `--key=value` flags, builds `NimbusConfig`, and wires objects together with plain constructors. Adds a shutdown hook that stops the server and closes the `HttpClient`. |
 | `NimbusConfig` | Immutable record. Precedence, lowest to highest: classpath `nimbus.properties` < `--config=<file>` < environment (`NIMBUS_CACHE_MAXBYTES`) < system properties (`-Dnimbus.cache.maxBytes`) < CLI flags (`--nimbus.cache.maxBytes=…`). Validates ranges and relationships (Section 3.7) and fails fast with clear messages. Builds the two `Route`s. |
-| `ProxyServer` | Creates and binds `HttpServer` (default `127.0.0.1:8080`; port 0 means a free port, for tests). Sets the virtual-thread executor and registers `/v1/`, `/metrics`, and `/health`. Owns the `ScheduledExecutorService` for idle-bucket eviction. `start()`, `stop()`, `port()`. |
+| `ProxyServer` | Creates and binds `HttpServer` (default `127.0.0.1:8080`; port 0 means a free port, for tests). Sets the virtual-thread executor and registers `/` (the proxy handler, so unknown paths also get a JSON 404), `/metrics`, and `/health`. Longest-prefix matching sends `/metrics` and `/health` to their own handlers. Owns the `ScheduledExecutorService` for idle-bucket eviction. `start()`, `stop()`, `port()`. |
 | `ProxyHandler` | Converts `HttpExchange` → `ProxyRequest` (method, path, raw query, client IP). Calls `ProxyService`, writes the `ProxyResponse`, and records latency. A catch-all turns any exception into a JSON 500 with `INTERNAL_ERROR`. Always closes the exchange in `finally`. A client disconnect during the write is logged at DEBUG level. |
 | `MetricsHandler` | `GET /metrics` → `ProxyMetrics.snapshot()` serialized with Gson. |
 | `HealthHandler` | `GET /health` → `{"status":"ok","upstreams":["<forecast url>","<geocoding url>"]}`. |
@@ -559,7 +561,7 @@ nimbus/
 | `Outcome` | Enum (Section 3.6) with `xCacheHeader()`, which returns `"HIT"`, `"MISS"`, `"STALE"`, `"COALESCED"`, or `null`. |
 | `Route` | `record Route(String path, URI upstreamUrl, Set<String> requiredParams, Duration ttl, Duration staleWindow)`. |
 | `QueryNormalizer` | Section 3.4. `String canonicalize(String rawQuery, Route route) throws BadRequestException`. `BadRequestException` carries the status (400 or 414) and reason. Nested `record QueryParam(String name, String value)`. |
-| `Cache<K,V>` | Interface: `V get(K)`, `boolean put(K,V)`, `V remove(K)`, `void clear()`, `int size()`, `long weightedSize()`, `long evictionCount()`. Implementations take `(int maxEntries, long maxBytes, ToLongBiFunction<K,V> weigher)` in their constructor. |
+| `Cache<K,V>` | Interface: `V get(K)`, `boolean put(K,V)`, `V remove(K)`, `void clear()`, `int size()`, `long weightedSize()`, `long evictionCount()`, and `List<K> keysInLruOrder()` (a snapshot from least to most recently used that doesn't change recency; O(n), for the model test and C1's key iteration — added in Phase 2). Implementations take `(int maxEntries, long maxBytes, ToLongBiFunction<K,V> weigher)` in their constructor. |
 | `LinkedHashMapCache<K,V>` | **Baseline.** `new LinkedHashMap<>(16, 0.75f, true)` (access order) guarded by one `ReentrantLock`. Eviction loops over `map.entrySet().iterator()` from the eldest entry while over a bound. It doesn't use `removeEldestEntry`, which removes at most one entry per `put` and can't enforce a byte bound. |
 | `LinkedListLruCache<K,V>` | **Track 2 stub only:** a constructor and methods that throw `UnsupportedOperationException("Track 2: owner implements")`, plus Javadoc listing the invariants to maintain. |
 | `CacheEntry` | Section 3.5. |
@@ -604,7 +606,7 @@ nimbus/
 | JSON | **Gson 2.14.0** (`com.google.code.gson:gson`) | One small JAR with no transitive dependencies. Supports records since 2.10. Used only by the GUI client, `/metrics`, and proxy error bodies. **The proxy never parses upstream bodies.** | Jackson (heavier), hand-written parser (an unrelated exercise) |
 | GUI | **Swing** (JDK) | Ships with the JDK; the whole project stays in Java. | JavaFX: unbundled since JDK 11, needs OpenJFX dependencies and a plugin, with no benefit here. |
 | Testing | **JUnit Jupiter 6.1.3** via `junit-bom` (JUnit 6 requires Java 17+) | `@Timeout`, `@RepeatedTest`, `@ParameterizedTest`, `@Tag`, abstract contract tests. | Mockito: hand-written fakes are clearer. |
-| Test runner | **maven-surefire-plugin 3.6.0** | Excludes `@Tag("live")` by default. | – |
+| Test runner | **maven-surefire-plugin 3.6.0** | Excludes `@Tag("live")` by default. Includes `*IT` classes as well as `*Test`, so `mvn -B verify` runs the loopback socket tests too. | – |
 | Compiler plugin | **maven-compiler-plugin 3.16.0** | Latest stable 3.x. Avoid the 4.0.0 betas. | – |
 | Packaging | **maven-shade-plugin 3.6.2**, producing one runnable JAR `target/nimbus.jar` with Gson included and `Main-Class: dev.nimbus.Main` | `java -jar` just works. | Assembly plugin, manual classpath |
 | Logging | `System.Logger` (JDK, backed by `java.util.logging`) | No dependency. | SLF4J/Logback |

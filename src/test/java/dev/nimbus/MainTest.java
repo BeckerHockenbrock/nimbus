@@ -55,8 +55,8 @@ class MainTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"server", "gui", "all", "bench", "fake-upstream"})
-    void eachModeIsAPlaceholder(String mode) {
+    @ValueSource(strings = {"gui", "all", "bench"})
+    void unimplementedModesArePlaceholders(String mode) {
         assertEquals(0, run(mode));
         assertEquals(mode + ": not implemented yet" + System.lineSeparator(), out());
     }
@@ -69,7 +69,20 @@ class MainTest {
 
     @Test
     void keyValueFlagsAreAccepted() {
-        assertEquals(0, run("server", "--port=0", "--nimbus.cache.maxBytes=1024"));
+        assertEquals(0, run("bench", "--port=0", "--nimbus.cache.maxBytes=1024"));
+    }
+
+    @Test
+    void serverWithInvalidConfigReturns2() {
+        assertEquals(2, run("server", "--nimbus.cache.maxBytes=lots"));
+        assertTrue(err().contains("nimbus.cache.maxBytes"), err());
+        assertEquals(2, run("server", "--nimbus.no.such.key=1"));
+    }
+
+    @Test
+    void fakeUpstreamWithInvalidOptionReturns2() {
+        assertEquals(2, run("fake-upstream", "--mode=sideways"));
+        assertEquals(2, run("fake-upstream", "--port=0", "--speed=11"));
     }
 
     @ParameterizedTest
