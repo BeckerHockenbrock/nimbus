@@ -6,13 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.nimbus.bench.FakeUpstreamServer;
-import dev.nimbus.cache.CacheEntry;
-import dev.nimbus.cache.FreshnessPolicy;
-import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
-import dev.nimbus.metrics.ProxyMetrics;
-import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.testutil.FakeUpstreamClient;
+import dev.nimbus.testutil.ProxyFixture;
 import dev.nimbus.upstream.HttpUpstreamClient;
 import dev.nimbus.upstream.UpstreamClient;
 
@@ -60,11 +56,8 @@ class ProxyServerIT {
     }
 
     private void startProxy(NimbusConfig config, UpstreamClient upstream) throws IOException {
-        LinkedHashMapCache<String, CacheEntry> cache = new LinkedHashMapCache<>(
-                config.cacheMaxEntries(), config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
-        ProxyMetrics metrics = new ProxyMetrics(config, cache, InstantSource.system());
-        server = new ProxyServer(config, new ProxyService(config.routes(), cache, upstream,
-                FreshnessPolicy.from(config), metrics, InstantSource.system(), config), metrics);
+        ProxyFixture fixture = ProxyFixture.create(config, upstream, InstantSource.system());
+        server = new ProxyServer(config, fixture.service(), fixture.metrics(), fixture.rateLimiter());
         server.start();
     }
 
@@ -190,5 +183,34 @@ class ProxyServerIT {
 
         assertEquals(504, response.statusCode());
         assertEquals("proxy", json(response).get("source").getAsString());
+    }
+
+    @Test
+    void rateLimitOverHttp() throws Exception {
+        NimbusConfig defaults = startFakeAndConfig();
+        NimbusConfig config = NimbusConfig.withOverrides(Map.of(
+                "nimbus.port", "0",
+                "nimbus.forecast.upstream", defaults.forecastUpstream().toString(),
+                "nimbus.geocoding.upstream", defaults.geocodingUpstream().toString(),
+                "nimbus.ratelimit.client.capacity", "2",
+                "nimbus.ratelimit.client.refillPerSecond", "0.001"));
+        upstreamClient = new HttpUpstreamClient(config.upstreamConnectTimeout(), config.upstreamDeadline(),
+                config.upstreamMaxResponseBytes());
+        startProxy(config, upstreamClient);
+
+        HttpResponse<String> first = send("GET", "/v1/search?name=Berlin");
+        send("GET", "/v1/search?name=Berlin");
+        HttpResponse<String> limited = send("GET", "/v1/search?name=Berlin");
+
+        assertEquals(200, first.statusCode());
+        assertEquals("2", first.headers().firstValue("X-RateLimit-Limit").orElseThrow());
+        assertEquals("1", first.headers().firstValue("X-RateLimit-Remaining").orElseThrow());
+        assertEquals(429, limited.statusCode());
+        assertEquals("1000", limited.headers().firstValue("Retry-After").orElseThrow());
+        assertEquals("0", limited.headers().firstValue("X-RateLimit-Remaining").orElseThrow());
+        assertEquals("proxy", json(limited).get("source").getAsString());
+        assertEquals(1, fake.totalRequests());
+        assertEquals(200, send("GET", "/health").statusCode(), "/health is not rate-limited");
+        assertEquals(200, send("GET", "/metrics").statusCode(), "/metrics is not rate-limited");
     }
 }

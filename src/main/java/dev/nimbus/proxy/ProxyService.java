@@ -5,41 +5,66 @@ import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.metrics.ProxyMetrics;
+import dev.nimbus.ratelimit.ClientRateLimiter;
+import dev.nimbus.ratelimit.RateLimitDecision;
+import dev.nimbus.ratelimit.UpstreamBudget;
 import dev.nimbus.upstream.UpstreamClient;
 import dev.nimbus.upstream.UpstreamException;
 import dev.nimbus.upstream.UpstreamResponse;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.InstantSource;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
  * Every proxy decision (PLAN.md, Section 3.2). Plain Java: takes a {@link ProxyRequest}, returns a
  * {@link ProxyResponse}, and never touches sockets.
+ *
+ * <p>Two separate limits protect two different things. The per-client {@link ClientRateLimiter} protects the proxy,
+ * so it applies to every proxied request, hits included. The {@link UpstreamBudget} protects the upstream, so only
+ * real upstream calls spend it.
  */
 public final class ProxyService {
 
     private static final System.Logger LOG = System.getLogger(ProxyService.class.getName());
 
+    /** Caps an upstream {@code Retry-After} so that a cooldown deadline can't overflow (2^31 s, as in RFC 9111). */
+    private static final long MAX_RETRY_AFTER_SECONDS = 1L << 31;
+
     private final Map<String, Route> routes;
     private final Cache<String, CacheEntry> cache;
     private final UpstreamClient upstream;
+    private final ClientRateLimiter rateLimiter;
+    private final UpstreamBudget budget;
+    private final Semaphore upstreamPermits;
     private final FreshnessPolicy freshness;
     private final ProxyMetrics metrics;
     private final InstantSource clock;
     private final NimbusConfig config;
     private final QueryNormalizer normalizer;
 
+    /**
+     * @param upstreamPermits caps concurrent upstream fetches, which bounds transient download memory at
+     *                        {@code maxConcurrent × maxResponseBytes}; normally {@code new Semaphore(maxConcurrent,
+     *                        true)}
+     */
     public ProxyService(List<Route> routes, Cache<String, CacheEntry> cache, UpstreamClient upstream,
+                        ClientRateLimiter rateLimiter, UpstreamBudget budget, Semaphore upstreamPermits,
                         FreshnessPolicy freshness, ProxyMetrics metrics, InstantSource clock, NimbusConfig config) {
         this.routes = routes.stream().collect(Collectors.toUnmodifiableMap(Route::path, Function.identity()));
         this.cache = cache;
         this.upstream = upstream;
+        this.rateLimiter = rateLimiter;
+        this.budget = budget;
+        this.upstreamPermits = upstreamPermits;
         this.freshness = freshness;
         this.metrics = metrics;
         this.clock = clock;
@@ -69,6 +94,21 @@ public final class ProxyService {
         if (route == null) {
             return ProxyResponse.error(404, "Unknown path: " + request.path(), Outcome.INVALID);
         }
+        // The client is its socket address. X-Forwarded-For is ignored: clients can forge it.
+        RateLimitDecision limit = rateLimiter.tryAcquire(request.clientId());
+        Map<String, String> limitHeaders = new LinkedHashMap<>();
+        limitHeaders.put("X-RateLimit-Limit", Integer.toString(limit.limit()));
+        limitHeaders.put("X-RateLimit-Remaining", Long.toString(limit.remaining()));
+        if (!limit.allowed()) {
+            limitHeaders.put("Retry-After", Long.toString(limit.retryAfterSeconds()));
+            return ProxyResponse.error(429, "Too many requests; retry in " + limit.retryAfterSeconds() + " s",
+                    Outcome.RATE_LIMITED, limitHeaders);
+        }
+        return lookup(route, request).withHeaders(limitHeaders);
+    }
+
+    /** Steps 4 to 6 of Section 3.2, for a request that passed the method, path, and rate-limit checks. */
+    private ProxyResponse lookup(Route route, ProxyRequest request) {
         String key;
         try {
             key = route.cacheKey(normalizer.canonicalize(request.rawQuery(), route));
@@ -102,8 +142,42 @@ public final class ProxyService {
         return new ProxyResponse(200, headers, entry.body(), Outcome.HIT);
     }
 
-    /** The single place where the upstream is called. */
+    /** Every miss comes through here: the concurrency cap and the budget, then the upstream call. */
     private ProxyResponse fetchFromUpstream(Route route, String key) {
+        if (!acquirePermit()) {
+            metrics.upstreamSkippedNoPermit();
+            return unavailable("Too many upstream requests in progress", 1);
+        }
+        try {
+            // The budget token is spent before the call, even if the call then fails: Open-Meteo counts failed calls
+            // too, so this is the conservative choice.
+            UpstreamBudget.Decision decision = budget.tryAcquire();
+            if (!decision.granted()) {
+                metrics.upstreamSkipped(decision.skipReason());
+                String reason = switch (decision.skipReason()) {
+                    case BUDGET -> "Upstream call budget exhausted";
+                    case COOLDOWN -> "Upstream calls paused after an upstream rate-limit response";
+                };
+                return unavailable(reason, decision.retryAfterSeconds());
+            }
+            return callUpstream(route, key);
+        } finally {
+            upstreamPermits.release();
+        }
+    }
+
+    /** Waits up to {@code permitWaitMs} for a concurrency permit. */
+    private boolean acquirePermit() {
+        try {
+            return upstreamPermits.tryAcquire(config.upstreamPermitWait().toNanos(), TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** The single place where the upstream is called. Call only while holding a permit and a budget token. */
+    private ProxyResponse callUpstream(Route route, String key) {
         UpstreamResponse response;
         long start = System.nanoTime();
         metrics.upstreamStarted();
@@ -119,9 +193,10 @@ public final class ProxyService {
         metrics.upstreamResponse(response.status());
         int status = response.status();
         if (status == 429) {
-            long retryAfter = Math.max(config.upstreamCooldown().toSeconds(), retryAfterSeconds(response));
+            long cooldown = Math.max(config.upstreamCooldown().toSeconds(), retryAfterSeconds(response));
+            budget.startCooldown(Duration.ofSeconds(cooldown));
             return ProxyResponse.error(503, "Upstream rate limit reached", Outcome.UPSTREAM_ERROR,
-                    Map.of("Retry-After", Long.toString(Math.max(1, retryAfter))));
+                    Map.of("Retry-After", Long.toString(Math.max(1, cooldown))));
         }
         if (status >= 500) {
             return ProxyResponse.error(502, "Upstream returned HTTP " + status, Outcome.UPSTREAM_ERROR);
@@ -164,6 +239,12 @@ public final class ProxyService {
         return new ProxyResponse(response.status(), headers, response.body(), Outcome.MISS);
     }
 
+    /** The upstream could not be called (no permit, budget, or cooldown) and no stale copy is usable. */
+    private static ProxyResponse unavailable(String reason, long retryAfterSeconds) {
+        return ProxyResponse.error(503, reason, Outcome.UNAVAILABLE,
+                Map.of("Retry-After", Long.toString(Math.max(1, retryAfterSeconds))));
+    }
+
     private ProxyResponse upstreamFailure(UpstreamException e) {
         return switch (e.kind()) {
             case TIMEOUT -> ProxyResponse.error(504,
@@ -184,7 +265,7 @@ public final class ProxyService {
             return 0;
         }
         try {
-            return Math.max(0, Long.parseLong(value.trim()));
+            return Math.clamp(Long.parseLong(value.trim()), 0, MAX_RETRY_AFTER_SECONDS);
         } catch (NumberFormatException e) {
             return 0; // An HTTP-date; the configured cooldown applies.
         }

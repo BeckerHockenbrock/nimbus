@@ -9,14 +9,19 @@ import java.util.List;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 
 /**
  * In-process {@link UpstreamClient} with scripted responses and exceptions.
  *
  * <p>One-shot behaviors queued with {@link #enqueue} run first, in order; then the default from {@link #respond}.
- * Every call is recorded, and an optional gate blocks calls until a test opens it.
+ * Every call is recorded, and an optional gate blocks calls until a test opens it. The peak number of concurrent
+ * calls is tracked.
  */
 public final class FakeUpstreamClient implements UpstreamClient {
 
@@ -25,6 +30,8 @@ public final class FakeUpstreamClient implements UpstreamClient {
     private volatile Function<URI, UpstreamResponse> defaultBehavior =
             uri -> TestEntries.response(200, "{\"uri\":\"" + uri + "\"}", "Content-Type", "application/json");
     private volatile CountDownLatch gate;
+    private final AtomicInteger active = new AtomicInteger();
+    private final AtomicInteger peakActive = new AtomicInteger();
 
     /** Sets the behavior for every call that has no queued behavior. */
     public FakeUpstreamClient respond(Function<URI, UpstreamResponse> behavior) {
@@ -61,18 +68,39 @@ public final class FakeUpstreamClient implements UpstreamClient {
 
     @Override
     public UpstreamResponse fetch(URI uri) {
-        calls.add(uri);
-        CountDownLatch g = gate;
-        if (g != null) {
-            try {
-                g.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new UpstreamException(UpstreamException.Kind.INTERRUPTED, "interrupted", e);
+        peakActive.accumulateAndGet(active.incrementAndGet(), Math::max);
+        try {
+            calls.add(uri);
+            CountDownLatch g = gate;
+            if (g != null) {
+                try {
+                    g.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new UpstreamException(UpstreamException.Kind.INTERRUPTED, "interrupted", e);
+                }
             }
+            Function<URI, UpstreamResponse> behavior = queued.poll();
+            return (behavior != null ? behavior : defaultBehavior).apply(uri);
+        } finally {
+            active.decrementAndGet();
         }
-        Function<URI, UpstreamResponse> behavior = queued.poll();
-        return (behavior != null ? behavior : defaultBehavior).apply(uri);
+    }
+
+    /** The most calls that were ever in progress at the same time. */
+    public int peakConcurrentCalls() {
+        return peakActive.get();
+    }
+
+    /** Waits until at least {@code n} calls have started (for example, are blocked on the gate). */
+    public void awaitCallCount(int n, Duration timeout) {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (calls.size() < n) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("expected " + n + " upstream calls, saw " + calls.size());
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+        }
     }
 
     public int callCount() {
