@@ -3,6 +3,7 @@ package dev.nimbus.metrics;
 import dev.nimbus.cache.Cache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.proxy.Outcome;
+import dev.nimbus.ratelimit.UpstreamBudget;
 import dev.nimbus.upstream.UpstreamException;
 
 import java.time.Duration;
@@ -33,6 +34,9 @@ public final class ProxyMetrics {
     private final LongAdder failuresTimeout = new LongAdder();
     private final LongAdder failuresConnection = new LongAdder();
     private final LongAdder failuresTooLarge = new LongAdder();
+    private final LongAdder skippedBudget = new LongAdder();
+    private final LongAdder skippedCooldown = new LongAdder();
+    private final LongAdder skippedNoPermit = new LongAdder();
     private final AtomicInteger inFlight = new AtomicInteger();
 
     private final LatencyRecorder all;
@@ -42,13 +46,14 @@ public final class ProxyMetrics {
     private final LatencyRecorder upstream;
 
     private final Cache<?, ?> cache;
+    private final UpstreamBudget budget;
     private final int maxEntries;
     private final long maxBytes;
     private final String cacheImpl;
     private final InstantSource clock;
     private final Instant started;
 
-    public ProxyMetrics(NimbusConfig config, Cache<?, ?> cache, InstantSource clock) {
+    public ProxyMetrics(NimbusConfig config, Cache<?, ?> cache, UpstreamBudget budget, InstantSource clock) {
         for (Outcome outcome : Outcome.values()) {
             outcomes.put(outcome, new LongAdder());
         }
@@ -59,6 +64,7 @@ public final class ProxyMetrics {
         stale = new LatencyRecorder(window);
         upstream = new LatencyRecorder(window);
         this.cache = cache;
+        this.budget = budget;
         this.maxEntries = config.cacheMaxEntries();
         this.maxBytes = config.cacheMaxBytes();
         this.cacheImpl = config.cacheImpl();
@@ -119,6 +125,19 @@ public final class ProxyMetrics {
         }
     }
 
+    /** A request needed the upstream but the budget or a cooldown stopped it. */
+    public void upstreamSkipped(UpstreamBudget.SkipReason reason) {
+        switch (reason) {
+            case BUDGET -> skippedBudget.increment();
+            case COOLDOWN -> skippedCooldown.increment();
+        }
+    }
+
+    /** A request needed the upstream but no concurrency permit freed up within {@code permitWaitMs}. */
+    public void upstreamSkippedNoPermit() {
+        skippedNoPermit.increment();
+    }
+
     // --- snapshot ---
 
     public MetricsSnapshot snapshot() {
@@ -143,9 +162,8 @@ public final class ProxyMetrics {
                         upstream5xx.sum(),
                         new MetricsSnapshot.Failures(failuresTimeout.sum(), failuresConnection.sum(),
                                 failuresTooLarge.sum()),
-                        // The upstream budget, cooldown, and concurrency cap arrive in Phase 4.
-                        new MetricsSnapshot.Skipped(0, 0, 0),
-                        false,
+                        new MetricsSnapshot.Skipped(skippedBudget.sum(), skippedCooldown.sum(), skippedNoPermit.sum()),
+                        budget.cooldownActive(),
                         inFlight.get()),
                 new MetricsSnapshot.CacheStats(cache.size(), maxEntries, cache.weightedSize(), maxBytes,
                         cache.evictionCount(), cacheImpl),

@@ -8,6 +8,8 @@ import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.proxy.ProxyService;
+import dev.nimbus.ratelimit.ClientRateLimiter;
+import dev.nimbus.ratelimit.UpstreamBudget;
 import dev.nimbus.server.ProxyServer;
 import dev.nimbus.upstream.HttpUpstreamClient;
 
@@ -19,6 +21,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 
 /**
  * Entry point. Parses the mode and {@code --key=value} flags, builds {@link NimbusConfig}, and wires the
@@ -115,10 +118,15 @@ public final class Main {
                 config.upstreamDeadline(), config.upstreamMaxResponseBytes());
         Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
                 (key, entry) -> entry.weightBytes(key));
-        ProxyMetrics metrics = new ProxyMetrics(config, cache, InstantSource.system());
-        ProxyService service = new ProxyService(config.routes(), cache, upstream, FreshnessPolicy.from(config),
-                metrics, InstantSource.system(), config);
-        ProxyServer server = new ProxyServer(config, service, metrics);
+        InstantSource clock = InstantSource.system();
+        ClientRateLimiter rateLimiter = new ClientRateLimiter(config.clientCapacity(), config.clientRefillPerSecond(),
+                clock);
+        UpstreamBudget budget = UpstreamBudget.from(config, clock);
+        ProxyMetrics metrics = new ProxyMetrics(config, cache, budget, clock);
+        ProxyService service = new ProxyService(config.routes(), cache, upstream, rateLimiter, budget,
+                new Semaphore(config.upstreamMaxConcurrent(), true), FreshnessPolicy.from(config), metrics, clock,
+                config);
+        ProxyServer server = new ProxyServer(config, service, metrics, rateLimiter);
         try {
             server.start();
         } catch (IOException e) {

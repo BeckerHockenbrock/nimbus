@@ -820,7 +820,7 @@ nimbus/
   1. MISS
   2. HIT
   3. HIT
-  4. Rate-limited (configure a capacity that forces it). *Deferred to Phase 4 (Phase 3 note):* the rate limiter doesn't exist until Phase 4, and a phase must not depend on a later one, so Phase 3 runs the other seven steps (`requests.total == 7`) and Phase 4 adds this step back.
+  4. Rate-limited (configure a capacity that forces it). *Deferred to Phase 4 (Phase 3 note):* the rate limiter doesn't exist until Phase 4, and a phase must not depend on a later one, so Phase 3 runs the other seven steps (`requests.total == 7`) and Phase 4 adds this step back. *(Phase 4 note: restored, with client capacity 3. Phase 4 also moved the upstream 429 to the end of `upstreamFailuresAreCountedByKind`, because the cooldown it now starts would otherwise turn the following requests into `UNAVAILABLE`.)*
   5. INVALID (missing `latitude`)
   6. 404 path
   7. Clock past fresh → MISS

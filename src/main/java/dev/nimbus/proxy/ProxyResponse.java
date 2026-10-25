@@ -28,6 +28,13 @@ public record ProxyResponse(int status, Map<String, String> headers, byte[] body
         Objects.requireNonNull(outcome, "outcome");
     }
 
+    /** This response with {@code extra} headers added, replacing any of the same name. */
+    public ProxyResponse withHeaders(Map<String, String> extra) {
+        Map<String, String> merged = new LinkedHashMap<>(headers);
+        merged.putAll(extra);
+        return new ProxyResponse(status, merged, body, outcome);
+    }
+
     /** A JSON error response {@code {"error":true,"reason":"...","source":"proxy"}}. */
     public static ProxyResponse error(int status, String reason, Outcome outcome, Map<String, String> extraHeaders) {
         Map<String, String> headers = new LinkedHashMap<>();

@@ -12,21 +12,26 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.nimbus.cache.Cache;
 import dev.nimbus.cache.CacheEntry;
-import dev.nimbus.cache.FreshnessPolicy;
-import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
-import dev.nimbus.metrics.ProxyMetrics;
+import dev.nimbus.metrics.MetricsSnapshot;
 import dev.nimbus.testutil.FakeUpstreamClient;
 import dev.nimbus.testutil.MutableClock;
+import dev.nimbus.testutil.ProxyFixture;
 import dev.nimbus.upstream.UpstreamException;
 import dev.nimbus.upstream.UpstreamResponse;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -34,19 +39,30 @@ class ProxyServiceTest {
 
     private static final String CLIENT = "127.0.0.1";
 
-    private final NimbusConfig config = NimbusConfig.withOverrides(Map.of(
+    private static final Map<String, String> UPSTREAMS = Map.of(
             "nimbus.forecast.upstream", "http://upstream.test/v1/forecast",
-            "nimbus.geocoding.upstream", "http://geo.test/v1/search"));
+            "nimbus.geocoding.upstream", "http://geo.test/v1/search");
+
+    private final NimbusConfig config = NimbusConfig.withOverrides(UPSTREAMS);
     private final FakeUpstreamClient upstream = new FakeUpstreamClient();
     private final MutableClock clock = new MutableClock();
-    private final Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(),
-            config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
-    private final ProxyMetrics metrics = new ProxyMetrics(config, cache, clock);
-    private final ProxyService service = new ProxyService(config.routes(), cache, upstream,
-            FreshnessPolicy.from(config), metrics, clock, config);
+    private final ProxyFixture fixture = ProxyFixture.create(config, upstream, clock);
+    private final Cache<String, CacheEntry> cache = fixture.cache();
+    private final ProxyService service = fixture.service();
 
     private ProxyResponse get(String path, String rawQuery) {
-        return service.handle(new ProxyRequest("GET", path, rawQuery, CLIENT));
+        return get(fixture, CLIENT, path, rawQuery);
+    }
+
+    private static ProxyResponse get(ProxyFixture fixture, String client, String path, String rawQuery) {
+        return fixture.service().handle(new ProxyRequest("GET", path, rawQuery, client));
+    }
+
+    /** A separate service over the same fake upstream and clock, with {@code overrides} on top of the defaults. */
+    private ProxyFixture fixtureWith(Map<String, String> overrides) {
+        Map<String, String> all = new HashMap<>(UPSTREAMS);
+        all.putAll(overrides);
+        return ProxyFixture.create(NimbusConfig.withOverrides(all), upstream, clock);
     }
 
     private static JsonObject json(ProxyResponse response) {
@@ -374,5 +390,136 @@ class ProxyServiceTest {
         assertEquals(Outcome.HIT, hit.outcome());
         assertEquals(String.valueOf(age), hit.headers().get("Age"));
         assertEquals("max-age=" + maxAge, hit.headers().get("Cache-Control"));
+    }
+
+    // --- Phase 4: rate limiting and upstream protection ---
+
+    private static MetricsSnapshot.Skipped skipped(ProxyFixture f) {
+        return f.metrics().snapshot().upstream().skipped();
+    }
+
+    @Test
+    void clientOverItsLimitGets429WithoutAnUpstreamCall() {
+        ProxyFixture f = fixtureWith(Map.of(
+                "nimbus.ratelimit.client.capacity", "3",
+                "nimbus.ratelimit.client.refillPerSecond", "0.5"));
+
+        ProxyResponse miss = get(f, CLIENT, "/v1/forecast", BERLIN);
+        ProxyResponse invalid = get(f, CLIENT, "/v1/forecast", "latitude=1");
+        ProxyResponse hit = get(f, CLIENT, "/v1/forecast", BERLIN);
+        ProxyResponse limited = get(f, CLIENT, "/v1/forecast", BERLIN);
+
+        assertEquals(Outcome.MISS, miss.outcome());
+        assertEquals("3", miss.headers().get("X-RateLimit-Limit"));
+        assertEquals("2", miss.headers().get("X-RateLimit-Remaining"));
+        assertEquals(400, invalid.status(), "a bad query is checked after the rate limit, and spends a token");
+        assertEquals("1", invalid.headers().get("X-RateLimit-Remaining"));
+        assertEquals(Outcome.HIT, hit.outcome(), "hits are rate-limited too");
+        assertEquals("0", hit.headers().get("X-RateLimit-Remaining"));
+        assertProxyError(limited, 429, Outcome.RATE_LIMITED);
+        assertEquals("2", limited.headers().get("Retry-After"), "one token at 0.5/s");
+        assertEquals("3", limited.headers().get("X-RateLimit-Limit"));
+        assertEquals("0", limited.headers().get("X-RateLimit-Remaining"));
+        assertEquals(1, upstream.callCount());
+
+        assertEquals(Outcome.INVALID, get(f, CLIENT, "/v1/nope", BERLIN).outcome(), "404 comes before the limit");
+        assertEquals(Outcome.HIT, get(f, "192.0.2.7", "/v1/forecast", BERLIN).outcome(), "clients are independent");
+        clock.advance(Duration.ofSeconds(2));
+        assertEquals(Outcome.HIT, get(f, CLIENT, "/v1/forecast", BERLIN).outcome());
+        assertEquals(1, upstream.callCount());
+    }
+
+    @Test
+    void emptyBudgetIs503UnavailableWithoutAnUpstreamCall() {
+        // One permit, so a permit leaked by the budget check would also show up as a noPermit skip.
+        ProxyFixture f = fixtureWith(Map.of(
+                "nimbus.upstream.perMinute", "2",
+                "nimbus.upstream.maxConcurrent", "1",
+                "nimbus.upstream.permitWaitMs", "0"));
+
+        assertEquals(Outcome.MISS, get(f, CLIENT, "/v1/forecast", "latitude=1&longitude=1").outcome());
+        assertEquals(Outcome.MISS, get(f, CLIENT, "/v1/forecast", "latitude=2&longitude=2").outcome());
+        ProxyResponse unavailable = get(f, CLIENT, "/v1/forecast", "latitude=3&longitude=3");
+
+        assertProxyError(unavailable, 503, Outcome.UNAVAILABLE);
+        assertEquals("30", unavailable.headers().get("Retry-After"), "2 per minute refills one token every 30 s");
+        assertEquals(new MetricsSnapshot.Skipped(1, 0, 0), skipped(f));
+        assertEquals(2, upstream.callCount());
+        assertEquals(Outcome.HIT, get(f, CLIENT, "/v1/forecast", "latitude=1&longitude=1").outcome(),
+                "hits don't need the budget");
+
+        clock.advance(Duration.ofSeconds(30));
+        assertEquals(Outcome.MISS, get(f, CLIENT, "/v1/forecast", "latitude=3&longitude=3").outcome());
+        assertEquals(new MetricsSnapshot.Skipped(1, 0, 0), skipped(f));
+    }
+
+    @Test
+    void upstream429StartsACooldownThatSkipsTheNextMiss() {
+        upstream.enqueue(response(429, "{}", "Retry-After", "90"));
+
+        assertProxyError(get("/v1/forecast", "latitude=1&longitude=1"), 503, Outcome.UPSTREAM_ERROR);
+        assertTrue(fixture.metrics().snapshot().upstream().cooldownActive());
+        ProxyResponse skippedMiss = get("/v1/forecast", "latitude=2&longitude=2");
+
+        assertProxyError(skippedMiss, 503, Outcome.UNAVAILABLE);
+        assertEquals("90", skippedMiss.headers().get("Retry-After"));
+        assertEquals(new MetricsSnapshot.Skipped(0, 1, 0), skipped(fixture));
+        assertEquals(1, upstream.callCount());
+
+        clock.advance(Duration.ofMillis(89_500));
+        assertEquals("1", get("/v1/forecast", "latitude=2&longitude=2").headers().get("Retry-After"), "rounded up");
+        clock.advance(Duration.ofMillis(500));
+        assertEquals(Outcome.MISS, get("/v1/forecast", "latitude=2&longitude=2").outcome());
+        assertFalse(fixture.metrics().snapshot().upstream().cooldownActive());
+        assertEquals(new MetricsSnapshot.Skipped(0, 2, 0), skipped(fixture));
+        assertEquals(2, upstream.callCount());
+    }
+
+    @Test
+    void shorterUpstreamRetryAfterKeepsTheConfiguredCooldown() {
+        upstream.enqueue(response(429, "{}", "Retry-After", "5"));
+        get("/v1/forecast", "latitude=1&longitude=1");
+
+        clock.advance(config.upstreamCooldown().minusSeconds(1));
+        assertEquals(Outcome.UNAVAILABLE, get("/v1/forecast", "latitude=1&longitude=1").outcome());
+        clock.advance(Duration.ofSeconds(1));
+        assertEquals(Outcome.MISS, get("/v1/forecast", "latitude=1&longitude=1").outcome());
+    }
+
+    @Test
+    @Timeout(10)
+    void concurrencyCapTurnsAwayAThirdMissAfterThePermitWait() throws Exception {
+        ProxyFixture f = fixtureWith(Map.of(
+                "nimbus.upstream.maxConcurrent", "2",
+                "nimbus.upstream.permitWaitMs", "50"));
+        CountDownLatch gate = new CountDownLatch(1);
+        upstream.gate(gate);
+        ProxyResponse third;
+        long waitedNanos;
+        Future<ProxyResponse> first;
+        Future<ProxyResponse> second;
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            first = pool.submit(() -> get(f, CLIENT, "/v1/forecast", "latitude=1&longitude=1"));
+            second = pool.submit(() -> get(f, CLIENT, "/v1/forecast", "latitude=2&longitude=2"));
+            upstream.awaitCallCount(2, Duration.ofSeconds(5));
+
+            long start = System.nanoTime();
+            third = get(f, CLIENT, "/v1/forecast", "latitude=3&longitude=3");
+            waitedNanos = System.nanoTime() - start;
+            assertEquals(2, f.metrics().snapshot().upstream().inFlight());
+            gate.countDown();
+        }
+
+        assertProxyError(third, 503, Outcome.UNAVAILABLE);
+        assertEquals("1", third.headers().get("Retry-After"));
+        assertTrue(waitedNanos >= Duration.ofMillis(50).toNanos(), "waited permitWaitMs first");
+        assertEquals(Outcome.MISS, first.get().outcome());
+        assertEquals(Outcome.MISS, second.get().outcome());
+        assertEquals(2, upstream.callCount());
+        assertEquals(2, upstream.peakConcurrentCalls());
+        assertEquals(new MetricsSnapshot.Skipped(0, 0, 1), skipped(f));
+        assertEquals(0, f.metrics().snapshot().upstream().inFlight());
+        assertEquals(Outcome.MISS, get(f, CLIENT, "/v1/forecast", "latitude=3&longitude=3").outcome(),
+                "permits are released");
     }
 }

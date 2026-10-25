@@ -7,13 +7,10 @@ import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.nimbus.bench.FakeUpstreamServer;
-import dev.nimbus.cache.CacheEntry;
-import dev.nimbus.cache.FreshnessPolicy;
-import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.proxy.Outcome;
-import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.server.ProxyServer;
+import dev.nimbus.testutil.ProxyFixture;
 import dev.nimbus.upstream.HttpUpstreamClient;
 
 import java.io.IOException;
@@ -49,12 +46,8 @@ class MetricsEndpointIT {
                 "nimbus.geocoding.upstream", fake.searchUrl().toString()));
         upstreamClient = new HttpUpstreamClient(config.upstreamConnectTimeout(), config.upstreamDeadline(),
                 config.upstreamMaxResponseBytes());
-        LinkedHashMapCache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(),
-                config.cacheMaxBytes(), (key, entry) -> entry.weightBytes(key));
-        ProxyMetrics metrics = new ProxyMetrics(config, cache, InstantSource.system());
-        ProxyService service = new ProxyService(config.routes(), cache, upstreamClient, FreshnessPolicy.from(config),
-                metrics, InstantSource.system(), config);
-        server = new ProxyServer(config, service, metrics);
+        ProxyFixture fixture = ProxyFixture.create(config, upstreamClient, InstantSource.system());
+        server = new ProxyServer(config, fixture.service(), fixture.metrics(), fixture.rateLimiter());
         server.start();
     }
 
