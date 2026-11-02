@@ -29,6 +29,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -324,7 +325,12 @@ class ProxyServiceTest {
         clock.advance(Duration.ofSeconds(301));
 
         assertEquals(404, get("/v1/forecast", BERLIN).status());
-        assertEquals(502, get("/v1/forecast", BERLIN).status(), "stale-if-error arrives in Phase 5");
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("max-age=0", stale.headers().get("Cache-Control"));
+        assertEquals("{\"v\":1}", new String(stale.body(), StandardCharsets.UTF_8));
 
         assertEquals(1, cache.size(), "kept for stale-if-error");
     }
@@ -521,5 +527,276 @@ class ProxyServiceTest {
         assertEquals(0, f.metrics().snapshot().upstream().inFlight());
         assertEquals(Outcome.MISS, get(f, CLIENT, "/v1/forecast", "latitude=3&longitude=3").outcome(),
                 "permits are released");
+    }
+
+    // --- Phase 5: Section 7.5 Error-Handling Matrix & Stale-If-Error ---
+
+    @Test
+    void staleServedOnUpstream429AndCooldownStarted() {
+        upstream.enqueue(forecastBody("{\"val\":\"old\"}"));
+        upstream.enqueue(response(429, "{}", "Retry-After", "90"));
+
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301)); // Expired, within stale window
+
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("max-age=0", stale.headers().get("Cache-Control"));
+        assertEquals("301", stale.headers().get("Age"));
+        assertEquals("{\"val\":\"old\"}", new String(stale.body(), StandardCharsets.UTF_8));
+        assertTrue(fixture.metrics().snapshot().upstream().cooldownActive(), "cooldown must be started");
+
+        // Next request for a cold key is rejected with 503 UNAVAILABLE due to cooldown
+        ProxyResponse cold = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(cold, 503, Outcome.UNAVAILABLE);
+        assertEquals("90", cold.headers().get("Retry-After"));
+    }
+
+    @Test
+    void upstream429WithoutStaleReturns503() {
+        upstream.enqueue(response(429, "{}", "Retry-After", "60"));
+        ProxyResponse res = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(res, 503, Outcome.UPSTREAM_ERROR);
+        assertEquals("60", res.headers().get("Retry-After"));
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {500, 502, 503})
+    void staleServedOnUpstream5xx(int status) {
+        upstream.enqueue(forecastBody("{\"data\":\"stale\"}"));
+        upstream.respond(response(status, "{\"error\":true}"));
+
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("{\"data\":\"stale\"}", new String(stale.body(), StandardCharsets.UTF_8));
+        assertEquals(1, cache.size());
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {500, 502, 503})
+    void upstream5xxWithoutStaleReturns502(int status) {
+        upstream.respond(response(status, "{\"error\":true}"));
+        ProxyResponse res = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+    }
+
+    @Test
+    void staleServedOnConnectionRefused() {
+        upstream.enqueue(forecastBody("{\"data\":\"stale-conn\"}"));
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.CONNECTION, "Connection refused", null);
+        });
+
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("{\"data\":\"stale-conn\"}", new String(stale.body(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void connectionRefusedWithoutStaleReturns502() {
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.CONNECTION, "Connection refused", null);
+        });
+        ProxyResponse res = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+    }
+
+    @Test
+    void staleServedOnBodyOverMaxResponseBytes() {
+        upstream.enqueue(forecastBody("{\"data\":\"stale-size\"}"));
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.TOO_LARGE, "Response too large", null);
+        });
+
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("{\"data\":\"stale-size\"}", new String(stale.body(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void bodyOverMaxResponseBytesWithoutStaleReturns502() {
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.TOO_LARGE, "Response too large", null);
+        });
+        ProxyResponse res = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+    }
+
+    @Test
+    void staleServedOnDeadlineExceeded() {
+        upstream.enqueue(forecastBody("{\"data\":\"stale-timeout\"}"));
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.TIMEOUT, "Timeout", null);
+        });
+
+        get("/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        ProxyResponse stale = get("/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("{\"data\":\"stale-timeout\"}", new String(stale.body(), StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void deadlineExceededWithoutStaleReturns504() {
+        upstream.respond(uri -> {
+            throw new UpstreamException(UpstreamException.Kind.TIMEOUT, "Timeout", null);
+        });
+        ProxyResponse res = get("/v1/forecast", "latitude=1&longitude=1");
+        assertProxyError(res, 504, Outcome.UPSTREAM_ERROR);
+    }
+
+    @Test
+    void staleServedWhenBudgetExhausted() {
+        ProxyFixture f = fixtureWith(Map.of("nimbus.upstream.perMinute", "1"));
+        upstream.respond(forecastBody("{\"data\":\"budget-stale\"}"));
+
+        get(f, CLIENT, "/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301)); // Expired, within stale window
+
+        // Spend the refilled token on another key so budget is exhausted
+        get(f, CLIENT, "/v1/forecast", "latitude=99&longitude=99");
+        assertEquals(2, upstream.callCount());
+
+        // Budget is now exhausted; stale usable for BERLIN -> STALE_WITHOUT_UPSTREAM
+        ProxyResponse stale = get(f, CLIENT, "/v1/forecast", BERLIN);
+        assertEquals(200, stale.status());
+        assertEquals(Outcome.STALE_WITHOUT_UPSTREAM, stale.outcome());
+        assertEquals("STALE", stale.headers().get("X-Cache"));
+        assertEquals("max-age=0", stale.headers().get("Cache-Control"));
+        assertEquals(2, upstream.callCount(), "no upstream call made for stale");
+
+        // Cold key with exhausted budget -> 503 UNAVAILABLE
+        ProxyResponse cold = get(f, CLIENT, "/v1/forecast", "latitude=2&longitude=2");
+        assertProxyError(cold, 503, Outcome.UNAVAILABLE);
+    }
+
+    @Test
+    void staleServedWhenNoConcurrencyPermit() throws Exception {
+        ProxyFixture f = fixtureWith(Map.of(
+                "nimbus.upstream.maxConcurrent", "1",
+                "nimbus.upstream.permitWaitMs", "20"));
+        upstream.respond(forecastBody("{\"data\":\"permit-stale\"}"));
+
+        get(f, CLIENT, "/v1/forecast", BERLIN);
+        clock.advance(Duration.ofSeconds(301));
+
+        CountDownLatch holdCall = new CountDownLatch(1);
+        upstream.gate(holdCall);
+
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            // First thread blocks holding the 1 concurrent permit
+            pool.submit(() -> get(f, "192.0.2.10", "/v1/forecast", "latitude=9&longitude=9"));
+            upstream.awaitCallCount(2, Duration.ofSeconds(5));
+
+            // Second request for expired warm key: cannot get permit, but has stale usable!
+            ProxyResponse stale = get(f, CLIENT, "/v1/forecast", BERLIN);
+            assertEquals(200, stale.status());
+            assertEquals(Outcome.STALE_WITHOUT_UPSTREAM, stale.outcome());
+            assertEquals("STALE", stale.headers().get("X-Cache"));
+
+            // Third request for cold key: cannot get permit, no stale -> 503 UNAVAILABLE
+            ProxyResponse cold = get(f, CLIENT, "/v1/forecast", "latitude=8&longitude=8");
+            assertProxyError(cold, 503, Outcome.UNAVAILABLE);
+
+            holdCall.countDown();
+        }
+    }
+
+    @Test
+    void mustRevalidateForbidsStaleAndUpstreamFailureReturns502() {
+        upstream.respond(forecastBody("{\"v\":1}", "Cache-Control", "must-revalidate"));
+        get("/v1/forecast", BERLIN);
+        CacheEntry entry = cache.get(BERLIN_KEY);
+        assertFalse(entry.staleAllowed(), "must-revalidate forbids stale");
+
+        clock.advance(Duration.ofSeconds(301));
+        upstream.respond(response(500, "{}"));
+
+        ProxyResponse res = get("/v1/forecast", BERLIN);
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+        assertEquals(0, cache.size(), "entry past staleUntil (=freshUntil) removed at lookup");
+    }
+
+    @Test
+    void staleWindowZeroForbidsStale() {
+        ProxyFixture f = fixtureWith(Map.of("nimbus.cache.forecast.staleSeconds", "0"));
+        upstream.respond(forecastBody("{\"v\":1}"));
+        get(f, CLIENT, "/v1/forecast", BERLIN);
+
+        clock.advance(Duration.ofSeconds(301));
+        upstream.respond(response(500, "{}"));
+
+        ProxyResponse res = get(f, CLIENT, "/v1/forecast", BERLIN);
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+    }
+
+    @Test
+    void pastStaleWindowEntryIsRemovedAtLookupAndUpstreamFailureReturns502() {
+        upstream.respond(forecastBody("{\"v\":1}"));
+        get("/v1/forecast", BERLIN);
+        assertEquals(1, cache.size());
+
+        // Advance past TTL + stale window (300s + 3600s = 3900s)
+        clock.advance(Duration.ofSeconds(3901));
+        upstream.respond(response(500, "{}"));
+
+        ProxyResponse res = get("/v1/forecast", BERLIN);
+        assertProxyError(res, 502, Outcome.UPSTREAM_ERROR);
+        assertEquals(0, cache.size(), "entry past staleUntil was removed at lookup");
+    }
+
+    @Test
+    void interruptedWhileWaitingForPermitRestoresInterruptFlag() throws Exception {
+        ProxyFixture f = fixtureWith(Map.of(
+                "nimbus.upstream.maxConcurrent", "1",
+                "nimbus.upstream.permitWaitMs", "5000"));
+        CountDownLatch inCall = new CountDownLatch(1);
+        upstream.gate(inCall);
+
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            pool.submit(() -> get(f, "192.0.2.10", "/v1/forecast", "latitude=1&longitude=1"));
+            upstream.awaitCallCount(1, Duration.ofSeconds(5));
+
+            CountDownLatch started = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(1);
+            boolean[] interruptedHolder = new boolean[1];
+
+            Thread t = new Thread(() -> {
+                started.countDown();
+                get(f, CLIENT, "/v1/forecast", "latitude=2&longitude=2");
+                interruptedHolder[0] = Thread.currentThread().isInterrupted();
+                done.countDown();
+            });
+            t.start();
+
+            started.await();
+            Thread.sleep(50); // Ensure thread is waiting in acquirePermit
+            t.interrupt();
+
+            done.await(5, TimeUnit.SECONDS);
+            assertTrue(interruptedHolder[0], "Thread interrupt flag should be restored");
+
+            inCall.countDown();
+        }
     }
 }

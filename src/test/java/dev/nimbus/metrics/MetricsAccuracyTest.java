@@ -221,4 +221,59 @@ class MetricsAccuracyTest {
         assertEquals(4, upstream.callCount());
         assertInvariants(s, 0, config.cacheMaxEntries(), config.cacheMaxBytes());
     }
+
+    /**
+     * STALE_WITHOUT_UPSTREAM vs STALE_AFTER_UPSTREAM_FAILURE are counted separately and exactly.
+     * upstreamCallsSaved includes the first and excludes the second. staleTotal is their sum.
+     */
+    @Test
+    @Timeout(10)
+    void staleOutcomesCountedSeparatelyAndFollowInvariants() {
+        configure(Map.of("nimbus.upstream.cooldownSeconds", "60"));
+        upstream.respond(response(200, "{\"v\":1}"));
+
+        // 1 & 2: Warm two keys
+        assertEquals(Outcome.MISS, get("/v1/forecast", "latitude=1&longitude=1").outcome());
+        assertEquals(Outcome.MISS, get("/v1/forecast", "latitude=2&longitude=2").outcome());
+
+        // Advance past TTL (300 s) but within stale window (3600 s)
+        clock.advance(Duration.ofSeconds(301));
+
+        // 3: key1 encounters upstream 429 -> STALE_AFTER_UPSTREAM_FAILURE, starts 60s cooldown
+        upstream.enqueue(response(429, "{}", "Retry-After", "60"));
+        ProxyResponse r3 = get("/v1/forecast", "latitude=1&longitude=1");
+        assertEquals(Outcome.STALE_AFTER_UPSTREAM_FAILURE, r3.outcome());
+        assertEquals("STALE", r3.headers().get("X-Cache"));
+
+        // 4: key2 while cooldown is active -> STALE_WITHOUT_UPSTREAM (no upstream call)
+        ProxyResponse r4 = get("/v1/forecast", "latitude=2&longitude=2");
+        assertEquals(Outcome.STALE_WITHOUT_UPSTREAM, r4.outcome());
+        assertEquals("STALE", r4.headers().get("X-Cache"));
+
+        // Advance past cooldown and warm a third key, then hit it
+        clock.advance(Duration.ofSeconds(61));
+        assertEquals(Outcome.MISS, get("/v1/forecast", "latitude=3&longitude=3").outcome()); // 5
+        assertEquals(Outcome.HIT, get("/v1/forecast", "latitude=3&longitude=3").outcome());  // 6
+
+        MetricsSnapshot s = metrics.snapshot();
+
+        assertEquals(6, s.requests().total());
+        assertEquals(expected(
+                Outcome.HIT, 1,
+                Outcome.MISS, 3,
+                Outcome.STALE_AFTER_UPSTREAM_FAILURE, 1,
+                Outcome.STALE_WITHOUT_UPSTREAM, 1),
+                s.requests().outcomes());
+        assertEquals(6, s.derived().lookups());
+        assertEquals(2, s.derived().staleTotal(), "staleTotal is sum of both stale outcomes");
+        assertEquals(2, s.derived().upstreamCallsSaved(),
+                "upstreamCallsSaved includes HIT and STALE_WITHOUT_UPSTREAM, excludes STALE_AFTER_UPSTREAM_FAILURE");
+        assertEquals(1.0 / 6, s.derived().cacheHitRatio());
+        assertEquals(2.0 / 6, s.derived().upstreamAvoidanceRatio());
+        assertEquals(4, s.upstream().calls(), "2 warm misses + 1 failed call + 1 new miss");
+        assertEquals(4, s.upstream().responses());
+        assertEquals(1, s.upstream().status429());
+        assertEquals(new MetricsSnapshot.Skipped(0, 1, 0), s.upstream().skipped());
+        assertInvariants(s, 0, config.cacheMaxEntries(), config.cacheMaxBytes());
+    }
 }

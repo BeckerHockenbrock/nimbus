@@ -126,8 +126,8 @@ public final class ProxyService {
         if (entry != null && entry.isFresh(now)) {
             return hit(entry, now);
         }
-        // An expired entry still inside its stale window stays cached; stale-if-error uses it from Phase 5.
-        return fetchFromUpstream(route, key);
+        // An expired entry still inside its stale window stays cached; stale-if-error uses it if staleAllowed is true.
+        return fetchFromUpstream(route, key, entry);
     }
 
     /** A fresh cached 200. {@code Cache-Control} tells clients how long it stays fresh. */
@@ -142,10 +142,47 @@ public final class ProxyService {
         return new ProxyResponse(200, headers, entry.body(), Outcome.HIT);
     }
 
-    /** Every miss comes through here: the concurrency cap and the budget, then the upstream call. */
-    private ProxyResponse fetchFromUpstream(Route route, String key) {
+    /** A stale cached 200 served on upstream failure or when the upstream could not be called. */
+    private static ProxyResponse stale(CacheEntry entry, Outcome outcome, Instant now) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (entry.contentType() != null) {
+            headers.put("Content-Type", entry.contentType());
+        }
+        headers.put("X-Cache", outcome.xCacheHeader());
+        headers.put("Age", Long.toString(entry.ageSeconds(now)));
+        headers.put("Cache-Control", "max-age=0");
+        return new ProxyResponse(200, headers, entry.body(), outcome);
+    }
+
+    /**
+     * Every miss comes through here: the concurrency cap and the budget, then the upstream call.
+     *
+     * <p><b>Track 1 seam (Request Coalescing):</b> This method is the single choke-point for all upstream misses.
+     * When request coalescing (single-flight) is implemented (Phase 9, Track 1):
+     * <ol>
+     *   <li>A {@code ConcurrentHashMap<String, CompletableFuture<ProxyResponse>> inFlight} tracks calls currently in progress.</li>
+     *   <li>The first caller for a cache key (the leader) registers a future via {@code putIfAbsent}. The leader
+     *       acquires a concurrency permit and budget token, fetches from upstream, caches the response, completes
+     *       the future, and removes the map entry in a {@code finally} block.</li>
+     *   <li>Concurrent callers for that key (followers) wait on the leader's future up to the deadline.
+     *       Followers receive {@link Outcome#COALESCED} and make no upstream call of their own.</li>
+     *   <li>If the leader's upstream call fails, followers apply the fallback to {@code staleCandidate} themselves,
+     *       returning {@link Outcome#STALE_WITHOUT_UPSTREAM} or {@link Outcome#UNAVAILABLE}.</li>
+     *   <li>Upstream calls must never be executed inside {@code ConcurrentHashMap#computeIfAbsent}'s lambda.</li>
+     * </ol>
+     *
+     * @param route          the route handling the request
+     * @param key            the canonical cache key
+     * @param staleCandidate an expired cache entry within its stale window, or {@code null} if none is usable
+     * @return the proxied response
+     */
+    private ProxyResponse fetchFromUpstream(Route route, String key, CacheEntry staleCandidate) {
         if (!acquirePermit()) {
             metrics.upstreamSkippedNoPermit();
+            Instant now = clock.instant();
+            if (staleCandidate != null && staleCandidate.isStaleUsable(now)) {
+                return stale(staleCandidate, Outcome.STALE_WITHOUT_UPSTREAM, now);
+            }
             return unavailable("Too many upstream requests in progress", 1);
         }
         try {
@@ -154,13 +191,17 @@ public final class ProxyService {
             UpstreamBudget.Decision decision = budget.tryAcquire();
             if (!decision.granted()) {
                 metrics.upstreamSkipped(decision.skipReason());
+                Instant now = clock.instant();
+                if (staleCandidate != null && staleCandidate.isStaleUsable(now)) {
+                    return stale(staleCandidate, Outcome.STALE_WITHOUT_UPSTREAM, now);
+                }
                 String reason = switch (decision.skipReason()) {
                     case BUDGET -> "Upstream call budget exhausted";
                     case COOLDOWN -> "Upstream calls paused after an upstream rate-limit response";
                 };
                 return unavailable(reason, decision.retryAfterSeconds());
             }
-            return callUpstream(route, key);
+            return callUpstream(route, key, staleCandidate);
         } finally {
             upstreamPermits.release();
         }
@@ -177,7 +218,7 @@ public final class ProxyService {
     }
 
     /** The single place where the upstream is called. Call only while holding a permit and a budget token. */
-    private ProxyResponse callUpstream(Route route, String key) {
+    private ProxyResponse callUpstream(Route route, String key, CacheEntry staleCandidate) {
         UpstreamResponse response;
         long start = System.nanoTime();
         metrics.upstreamStarted();
@@ -186,6 +227,10 @@ public final class ProxyService {
         } catch (UpstreamException e) {
             metrics.upstreamFailure(e.kind());
             LOG.log(System.Logger.Level.WARNING, "Upstream " + e.kind() + " for " + key + ": " + e.getMessage());
+            Instant now = clock.instant();
+            if (staleCandidate != null && staleCandidate.isStaleUsable(now)) {
+                return stale(staleCandidate, Outcome.STALE_AFTER_UPSTREAM_FAILURE, now);
+            }
             return upstreamFailure(e);
         } finally {
             metrics.upstreamFinished(System.nanoTime() - start);
@@ -195,10 +240,18 @@ public final class ProxyService {
         if (status == 429) {
             long cooldown = Math.max(config.upstreamCooldown().toSeconds(), retryAfterSeconds(response));
             budget.startCooldown(Duration.ofSeconds(cooldown));
+            Instant now = clock.instant();
+            if (staleCandidate != null && staleCandidate.isStaleUsable(now)) {
+                return stale(staleCandidate, Outcome.STALE_AFTER_UPSTREAM_FAILURE, now);
+            }
             return ProxyResponse.error(503, "Upstream rate limit reached", Outcome.UPSTREAM_ERROR,
                     Map.of("Retry-After", Long.toString(Math.max(1, cooldown))));
         }
         if (status >= 500) {
+            Instant now = clock.instant();
+            if (staleCandidate != null && staleCandidate.isStaleUsable(now)) {
+                return stale(staleCandidate, Outcome.STALE_AFTER_UPSTREAM_FAILURE, now);
+            }
             return ProxyResponse.error(502, "Upstream returned HTTP " + status, Outcome.UPSTREAM_ERROR);
         }
         if (status == 200) {
