@@ -5,6 +5,7 @@ import dev.nimbus.cache.Cache;
 import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.cache.LinkedHashMapCache;
+import dev.nimbus.cache.LinkedListLruCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.proxy.ProxyService;
@@ -116,8 +117,13 @@ public final class Main {
         NimbusConfig config = NimbusConfig.load(flags, System.getenv(), System.getProperties());
         HttpUpstreamClient upstream = new HttpUpstreamClient(config.upstreamConnectTimeout(),
                 config.upstreamDeadline(), config.upstreamMaxResponseBytes());
-        Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
-                (key, entry) -> entry.weightBytes(key));
+        Cache<String, CacheEntry> cache = switch (config.cacheImpl()) {
+            case "linkedhashmap" -> new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
+                    (key, entry) -> entry.weightBytes(key));
+            case "custom" -> new LinkedListLruCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
+                    (key, entry) -> entry.weightBytes(key));
+            default -> throw new IllegalArgumentException("Unknown cache impl: " + config.cacheImpl());
+        };
         InstantSource clock = InstantSource.system();
         ClientRateLimiter rateLimiter = new ClientRateLimiter(config.clientCapacity(), config.clientRefillPerSecond(),
                 clock);

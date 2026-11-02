@@ -4,6 +4,7 @@ import dev.nimbus.cache.Cache;
 import dev.nimbus.cache.CacheEntry;
 import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.cache.LinkedHashMapCache;
+import dev.nimbus.cache.LinkedListLruCache;
 import dev.nimbus.config.NimbusConfig;
 import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.proxy.ProxyService;
@@ -19,8 +20,13 @@ public record ProxyFixture(NimbusConfig config, Cache<String, CacheEntry> cache,
                            UpstreamBudget budget, ProxyMetrics metrics, ProxyService service) {
 
     public static ProxyFixture create(NimbusConfig config, UpstreamClient upstream, InstantSource clock) {
-        Cache<String, CacheEntry> cache = new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
-                (key, entry) -> entry.weightBytes(key));
+        Cache<String, CacheEntry> cache = switch (config.cacheImpl()) {
+            case "linkedhashmap" -> new LinkedHashMapCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
+                    (key, entry) -> entry.weightBytes(key));
+            case "custom" -> new LinkedListLruCache<>(config.cacheMaxEntries(), config.cacheMaxBytes(),
+                    (key, entry) -> entry.weightBytes(key));
+            default -> throw new IllegalArgumentException("Unknown cache impl: " + config.cacheImpl());
+        };
         ClientRateLimiter rateLimiter = new ClientRateLimiter(config.clientCapacity(), config.clientRefillPerSecond(),
                 clock);
         UpstreamBudget budget = UpstreamBudget.from(config, clock);
