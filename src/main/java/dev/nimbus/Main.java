@@ -7,6 +7,11 @@ import dev.nimbus.cache.FreshnessPolicy;
 import dev.nimbus.cache.LinkedHashMapCache;
 import dev.nimbus.cache.LinkedListLruCache;
 import dev.nimbus.config.NimbusConfig;
+import dev.nimbus.client.NimbusClient;
+import dev.nimbus.gui.NimbusApp;
+import java.awt.GraphicsEnvironment;
+import java.net.URI;
+import javax.swing.SwingUtilities;
 import dev.nimbus.metrics.ProxyMetrics;
 import dev.nimbus.proxy.ProxyService;
 import dev.nimbus.ratelimit.ClientRateLimiter;
@@ -97,7 +102,9 @@ public final class Main {
         }
         try {
             return switch (mode) {
-                case "server" -> runServer(flags, out);
+                case "server" -> runServer(flags, out, false);
+                case "all" -> runServer(flags, out, true);
+                case "gui" -> runGui(flags);
                 case "fake-upstream" -> runFakeUpstream(flags, out);
                 default -> {
                     out.println(mode + ": not implemented yet");
@@ -113,7 +120,8 @@ public final class Main {
         }
     }
 
-    private static int runServer(List<String> flags, PrintStream out) throws IOException {
+    private static int runServer(List<String> flags, PrintStream out, boolean gui) throws IOException {
+        if (gui && GraphicsEnvironment.isHeadless()) throw new IOException("A graphical display is required for all mode");
         NimbusConfig config = NimbusConfig.load(flags, System.getenv(), System.getProperties());
         HttpUpstreamClient upstream = new HttpUpstreamClient(config.upstreamConnectTimeout(),
                 config.upstreamDeadline(), config.upstreamMaxResponseBytes());
@@ -145,7 +153,27 @@ public final class Main {
         }, "nimbus-shutdown"));
         out.println("Nimbus proxy listening on http://" + config.host() + ":" + server.port());
         out.println("Upstreams: " + config.forecastUpstream() + ", " + config.geocodingUpstream());
+        if (gui) {
+            String host = config.host().equals("0.0.0.0") || config.host().equals("::") ? "127.0.0.1" : config.host();
+            URI url = URI.create("http://" + (host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host) + ":" + server.port());
+            try { new NimbusClient(url).health(); }
+            catch (InterruptedException e) { Thread.currentThread().interrupt(); server.stop(); upstream.close(); throw new IOException("Interrupted waiting for proxy health", e); }
+            catch (IOException e) { server.stop(); upstream.close(); throw new IOException("Proxy health check failed", e); }
+            CountDownLatch closed = new CountDownLatch(1);
+            SwingUtilities.invokeLater(() -> NimbusApp.open(url, config.guiMetricsRefresh(), closed::countDown));
+            try { closed.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return EXIT_OK;
+        }
         return awaitShutdown();
+    }
+
+    private static int runGui(List<String> flags) throws IOException {
+        NimbusConfig config = NimbusConfig.load(flags, System.getenv(), System.getProperties());
+        if (GraphicsEnvironment.isHeadless()) throw new IOException("A graphical display is required for gui mode");
+        CountDownLatch closed = new CountDownLatch(1);
+        SwingUtilities.invokeLater(() -> NimbusApp.open(config.guiProxyUrl(), config.guiMetricsRefresh(), closed::countDown));
+        try { closed.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        return EXIT_OK;
     }
 
     private static int runFakeUpstream(List<String> flags, PrintStream out) throws IOException {

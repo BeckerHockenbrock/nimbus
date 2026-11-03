@@ -55,16 +55,10 @@ class MainTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"gui", "all", "bench"})
+    @ValueSource(strings = {"bench"})
     void unimplementedModesArePlaceholders(String mode) {
         assertEquals(0, run(mode));
         assertEquals(mode + ": not implemented yet" + System.lineSeparator(), out());
-    }
-
-    @Test
-    void noArgumentsRunsDefaultMode() {
-        assertEquals(0, run());
-        assertTrue(out().startsWith("all: not implemented yet"), out());
     }
 
     @Test
